@@ -68,16 +68,26 @@ class InputConfigs:
     e2m1_codes: bool = False
 
 
-def decode_e2m1_codes(v_int4: jax.Array, dtype) -> jax.Array:
-    """E2M1 nibble c stored as int4 v = c - 16*(c >= 8) -> its FP4 value, exactly.
+E2M1_DECODE = os.environ.get("SGLJAX_E2M1_DECODE", "bits")
+# "bits" decodes to E2M1 value * 2**-6; the caller's scales carry the 2**6 back.
+E2M1_DECODE_SCALE_EXP = {"bits": 6, "bits16": 6, "arith": 0}[E2M1_DECODE]
 
-    Magnitude code m = v mod 8 maps to {0, .5, 1, 1.5, 2, 3, 4, 6}
-    = 0.5*m + 0.5*max(m-4, 0) + max(m-6, 0); the sign is v < 0.
+
+def decode_e2m1_codes(v_int4: jax.Array, dtype) -> jax.Array:
+    """E2M1 nibble c stored as int4 v = c - 16*(c >= 8) -> its FP4 value (x 2**-E2M1_DECODE_SCALE_EXP).
+
+    "bits": FP4 -> FP8 by bit placement, no arithmetic. For c = s|ee|m, the E4M3 byte
+            s<<7 | ee<<3 | m<<2 equals value(c) * 2**-6 exactly, subnormals and zero included,
+            so the byte is (c & 8) << 4 | (c & 7) << 2; then a native f8 -> bf16 convert.
+    "arith": magnitude code m = v mod 8 -> 0.5*m + 0.5*max(m-4, 0) + max(m-6, 0), signed.
     """
-    # Every intermediate is a small multiple of 0.5, exact in bf16; packed bf16 VPU math is
-    # ~2x f32 throughput on v6e.
-    math_dtype = jnp.bfloat16 if os.environ.get("SGLJAX_E2M1_DECODE_F32", "0") != "1" else jnp.float32
-    v = v_int4.astype(math_dtype)
+    if E2M1_DECODE in ("bits", "bits16"):
+        it = jnp.int16 if E2M1_DECODE == "bits16" else jnp.int32
+        c = v_int4.astype(it) & 15
+        byte = ((c & 8) << 4) | ((c & 7) << 2)
+        f8 = jax.lax.bitcast_convert_type(byte.astype(jnp.uint8), jnp.float8_e4m3fn)
+        return f8.astype(dtype)
+    v = v_int4.astype(jnp.bfloat16)
     neg = v < 0
     m = jnp.where(neg, v + 8, v)
     mag = 0.5 * m + 0.5 * jnp.maximum(m - 4, 0) + jnp.maximum(m - 6, 0)

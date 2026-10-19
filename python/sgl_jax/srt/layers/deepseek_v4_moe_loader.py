@@ -253,7 +253,11 @@ def mxfp4_pair_to_resident_fp4(packed: np.ndarray, codes: np.ndarray, *, key: st
     nibbles[:, 1::2] = packed >> np.uint8(4)
     # Same 4 bits, reinterpreted as two's-complement int4 (Mosaic can unpack int4 on v5e/v6e).
     weight = (nibbles.astype(np.int8) - np.int8(16) * (nibbles >= 8)).astype(ml_dtypes.int4).T
-    scale = np.ldexp(np.ones(codes.shape, np.float32), codes.astype(np.int16) - 127)
+    # GMM's E2M1 decode may return value * 2**-E2M1_DECODE_SCALE_EXP; carry that in the scale.
+    from sgl_jax.srt.kernels.gmm.megablox_gmm_kernel.gmm_v2 import E2M1_DECODE_SCALE_EXP
+
+    exp = codes.astype(np.int16) - 127 + E2M1_DECODE_SCALE_EXP
+    scale = np.ldexp(np.ones(codes.shape, np.float32), exp)
     return np.ascontiguousarray(weight), scale.astype(ml_dtypes.bfloat16).T[:, None, :]
 
 
