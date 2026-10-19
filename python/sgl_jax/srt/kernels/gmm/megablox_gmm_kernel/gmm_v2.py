@@ -70,7 +70,9 @@ class InputConfigs:
 
 E2M1_DECODE = os.environ.get("SGLJAX_E2M1_DECODE", "bits")
 # "bits" decodes to E2M1 value * 2**-6; the caller's scales carry the 2**6 back.
-E2M1_DECODE_SCALE_EXP = {"bits": 6, "bits16": 6, "arith": 0}[E2M1_DECODE]
+E2M1_DECODE_SCALE_EXP = {"bits": 6, "bits16": 6, "arith": 0, "unpack": 0}[E2M1_DECODE]
+# Profiling only (wrong numerics): skip the per-K32 scale multiply in the E2M1 path.
+_E2M1_PROFILE_NO_SCALE = os.environ.get("SGLJAX_E2M1_PROFILE_NO_SCALE", "0") == "1"
 
 
 def decode_e2m1_codes(v_int4: jax.Array, dtype) -> jax.Array:
@@ -81,6 +83,8 @@ def decode_e2m1_codes(v_int4: jax.Array, dtype) -> jax.Array:
             so the byte is (c & 8) << 4 | (c & 7) << 2; then a native f8 -> bf16 convert.
     "arith": magnitude code m = v mod 8 -> 0.5*m + 0.5*max(m-4, 0) + max(m-6, 0), signed.
     """
+    if E2M1_DECODE == "unpack":  # profiling only: int4 -> bf16 convert, no decode
+        return v_int4.astype(dtype)
     if E2M1_DECODE in ("bits", "bits16"):
         it = jnp.int16 if E2M1_DECODE == "bits16" else jnp.int32
         c = v_int4.astype(it) & 15
@@ -270,7 +274,10 @@ def inner_kernel(
                 tile_k, tile_n = tiled_rhs.shape
                 scale = tiled_rhs_ref.scale[...].astype(tiled_lhs.dtype)  # [tile_k/blk, 1, tn]
                 w = decode_e2m1_codes(tiled_rhs, tiled_lhs.dtype)
-                w = (w.reshape(tile_k // rhs_block, rhs_block, tile_n) * scale).reshape(tile_k, tile_n)
+                if not _E2M1_PROFILE_NO_SCALE:
+                    w = (w.reshape(tile_k // rhs_block, rhs_block, tile_n) * scale).reshape(
+                        tile_k, tile_n
+                    )
                 acc = jnp.matmul(
                     tiled_lhs, w, preferred_element_type=jnp.float32
                 ).astype(acc_ref.dtype)
