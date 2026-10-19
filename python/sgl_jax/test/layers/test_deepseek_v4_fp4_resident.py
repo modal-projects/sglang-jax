@@ -63,7 +63,7 @@ def test_gmm_v2_fp4_block_scale_matches_dequantized_reference(m_per_group):
     import jax
     import jax.numpy as jnp
 
-    from sgl_jax.srt.kernels.gmm.megablox_gmm_kernel.gmm_v2 import gmm_v2
+    from sgl_jax.srt.kernels.gmm.megablox_gmm_backend import gmm
 
     if jax.devices()[0].platform != "tpu":
         pytest.skip("needs TPU")
@@ -82,10 +82,11 @@ def test_gmm_v2_fp4_block_scale_matches_dequantized_reference(m_per_group):
     m = groups * m_per_group
     lhs = jnp.asarray(rng.standard_normal((m, k)).astype(np.float32) * 0.05, jnp.bfloat16)
 
-    out = gmm_v2(
-        lhs, rhs, group_sizes, rhs_scale=rhs_scale, preferred_element_type=jnp.float32,
-        rhs_e2m1_codes=True,
-    )
+    # Through the backend, which pads rows to the v2 alignment like EPMoE's calls.
+    out = gmm(
+        lhs=lhs, rhs=rhs, group_sizes=group_sizes, rhs_scale=rhs_scale,
+        preferred_element_type=jnp.float32, maybe_quantize_lhs=False, rhs_e2m1_codes=True,
+    )[:m]
     out = np.asarray(out, np.float32)
 
     lhs32 = np.asarray(lhs, np.float32)

@@ -4,6 +4,8 @@ import functools
 from collections.abc import Callable
 from typing import Any
 
+import os
+
 import jax
 import jax.numpy as jnp
 from jax import lax
@@ -72,10 +74,13 @@ def decode_e2m1_codes(v_int4: jax.Array, dtype) -> jax.Array:
     Magnitude code m = v mod 8 maps to {0, .5, 1, 1.5, 2, 3, 4, 6}
     = 0.5*m + 0.5*max(m-4, 0) + max(m-6, 0); the sign is v < 0.
     """
-    v = v_int4.astype(jnp.float32)
+    # Every intermediate is a small multiple of 0.5, exact in bf16; packed bf16 VPU math is
+    # ~2x f32 throughput on v6e.
+    math_dtype = jnp.bfloat16 if os.environ.get("SGLJAX_E2M1_DECODE_F32", "0") != "1" else jnp.float32
+    v = v_int4.astype(math_dtype)
     neg = v < 0
-    m = jnp.where(neg, v + 8.0, v)
-    mag = 0.5 * m + 0.5 * jnp.maximum(m - 4.0, 0.0) + jnp.maximum(m - 6.0, 0.0)
+    m = jnp.where(neg, v + 8, v)
+    mag = 0.5 * m + 0.5 * jnp.maximum(m - 4, 0) + jnp.maximum(m - 6, 0)
     return jnp.where(neg, -mag, mag).astype(dtype)
 
 
