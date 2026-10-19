@@ -238,7 +238,8 @@ def mxfp4_pair_to_resident_fp4(packed: np.ndarray, codes: np.ndarray, *, key: st
 
     packed: [N, K/2] bytes, two E2M1 values per byte along K, low nibble first.
     codes:  [N, K/32] E8M0 exponent codes, one per 32 consecutive K values.
-    Returns weight [K, N] float4_e2m1fn and scale [K/32, 1, N] bf16 (powers of two, exact).
+    Returns weight [K, N] int4 holding the E2M1 bit codes (nibble c stored as c - 16*(c >= 8);
+    see gmm_v2.decode_e2m1_codes) and scale [K/32, 1, N] bf16 (powers of two, exact).
     """
     packed = np.ascontiguousarray(packed).view(np.uint8)
     codes = np.ascontiguousarray(codes).view(np.uint8)
@@ -250,8 +251,8 @@ def mxfp4_pair_to_resident_fp4(packed: np.ndarray, codes: np.ndarray, *, key: st
     nibbles = np.empty((n, 2 * half_k), np.uint8)
     nibbles[:, 0::2] = packed & np.uint8(0x0F)
     nibbles[:, 1::2] = packed >> np.uint8(4)
-    # E2M1 nibble codes are exactly float4_e2m1fn's bit patterns.
-    weight = nibbles.view(ml_dtypes.float4_e2m1fn).T
+    # Same 4 bits, reinterpreted as two's-complement int4 (Mosaic can unpack int4 on v5e/v6e).
+    weight = (nibbles.astype(np.int8) - np.int8(16) * (nibbles >= 8)).astype(ml_dtypes.int4).T
     scale = np.ldexp(np.ones(codes.shape, np.float32), codes.astype(np.int16) - 127)
     return np.ascontiguousarray(weight), scale.astype(ml_dtypes.bfloat16).T[:, None, :]
 
@@ -505,7 +506,7 @@ def load_moe_weights(
             stem = prefix + f"experts.{expert_id}.{source}"
             wk, sk = stem + ".weight", stem + ".scale"
             weight_entry, scale_entry = assigned[wk][0], assigned[sk][0]
-            if weight_param.value.dtype == jnp.float4_e2m1fn:
+            if weight_param.value.dtype == jnp.int4:
                 with (
                     open(weight_entry["file"], "rb") as weight_source,
                     open(scale_entry["file"], "rb") as scale_source,

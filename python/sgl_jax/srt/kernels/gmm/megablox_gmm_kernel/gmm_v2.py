@@ -62,6 +62,21 @@ class InputConfigs:
     quant_block_size: int | None
     has_bias: bool = False
     has_scale: bool = False
+    # rhs is int4 holding E2M1 (FP4) bit codes, dequantized to bf16 in VMEM (W4A16).
+    e2m1_codes: bool = False
+
+
+def decode_e2m1_codes(v_int4: jax.Array, dtype) -> jax.Array:
+    """E2M1 nibble c stored as int4 v = c - 16*(c >= 8) -> its FP4 value, exactly.
+
+    Magnitude code m = v mod 8 maps to {0, .5, 1, 1.5, 2, 3, 4, 6}
+    = 0.5*m + 0.5*max(m-4, 0) + max(m-6, 0); the sign is v < 0.
+    """
+    v = v_int4.astype(jnp.float32)
+    neg = v < 0
+    m = jnp.where(neg, v + 8.0, v)
+    mag = 0.5 * m + 0.5 * jnp.maximum(m - 4.0, 0.0) + jnp.maximum(m - 6.0, 0.0)
+    return jnp.where(neg, -mag, mag).astype(dtype)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -233,13 +248,14 @@ def inner_kernel(
         )
 
         if cfgs.lhs_cfgs.quant_dtype is None:
-            if is_block_rhs_scale and jax.dtypes.itemsize_bits(tiled_rhs.dtype) == 4:
-                # W4A16 with fine block scales (MXFP4 K32): per-block matmuls would be K=32
-                # wide, so dequantize the whole tile in VMEM and run one full-K matmul.
+            if cfgs.rhs_cfgs.e2m1_codes:
+                # W4A16 MXFP4: per-block matmuls would be K=32 wide, so dequantize the whole
+                # tile in VMEM (E2M1 decode x per-K32 scale) and run one full-K matmul.
+                assert is_block_rhs_scale, "E2M1 codes require block-wise rhs_scale"
                 tile_k, tile_n = tiled_rhs.shape
                 scale = tiled_rhs_ref.scale[...].astype(tiled_lhs.dtype)  # [tile_k/blk, 1, tn]
-                w = tiled_rhs.astype(tiled_lhs.dtype).reshape(tile_k // rhs_block, rhs_block, tile_n)
-                w = (w * scale).reshape(tile_k, tile_n)
+                w = decode_e2m1_codes(tiled_rhs, tiled_lhs.dtype)
+                w = (w.reshape(tile_k // rhs_block, rhs_block, tile_n) * scale).reshape(tile_k, tile_n)
                 acc = jnp.matmul(
                     tiled_lhs, w, preferred_element_type=jnp.float32
                 ).astype(acc_ref.dtype)
@@ -848,6 +864,7 @@ def make_gmm_configs(
     acc_dtype: jnp.dtype | None,
     maybe_quantize_lhs: bool,
     zero_initialize: bool,
+    rhs_e2m1_codes: bool = False,
 ):
     """Fills the GMM config for the GMM kernel."""
 
@@ -868,12 +885,12 @@ def make_gmm_configs(
         quant_block_size=block_size,
         has_bias=rhs_bias is not None,
         has_scale=has_scale,
+        e2m1_codes=rhs_e2m1_codes,
     )
 
     lhs_q_dtype = None
-    # FP4 weights are dequantized to bf16 in VMEM (W4A16); Mosaic has no f8 x f4 matmul.
-    rhs_is_fp4 = rhs_quant_dtype is not None and jax.dtypes.itemsize_bits(rhs_quant_dtype) == 4
-    if maybe_quantize_lhs and rhs_quant_dtype is not None and not rhs_is_fp4:
+    # E2M1-coded weights are dequantized to bf16 in VMEM (W4A16): never quantize lhs for them.
+    if maybe_quantize_lhs and rhs_quant_dtype is not None and not rhs_e2m1_codes:
         # Choose lhs quantization dtype based on TPU hardware support.
         is_rhs_float = jnp.issubdtype(rhs_quant_dtype, jnp.floating)
         tpu_info = pltpu.get_tpu_info()
@@ -947,6 +964,7 @@ def get_metadata(cfgs: GmmConfigs):
         "acc_dtype",
         "maybe_quantize_lhs",
         "zero_initialize",
+        "rhs_e2m1_codes",
     ]
 )
 def gmm_v2(
@@ -964,6 +982,7 @@ def gmm_v2(
     acc_dtype: jnp.dtype | None = None,
     maybe_quantize_lhs: bool = True,
     zero_initialize: bool = True,
+    rhs_e2m1_codes: bool = False,
 ) -> jax.Array:
     """GMM kernel implemented with emit_pipeline.
 
@@ -1014,6 +1033,7 @@ def gmm_v2(
         acc_dtype=acc_dtype,
         maybe_quantize_lhs=maybe_quantize_lhs,
         zero_initialize=zero_initialize,
+        rhs_e2m1_codes=rhs_e2m1_codes,
     )
     dims = cfgs.dims
     tiles = cfgs.tiles
@@ -1021,7 +1041,9 @@ def gmm_v2(
     # Prepare block specs.
     rhs_scale_spec = rhs_bias_spec = None
     if rhs_scale is not None:
-        rhs_scale = rhs_scale.astype(jnp.float32)
+        if not rhs_e2m1_codes:
+            # E2M1 scales stay bf16 (exact powers of two): an f32 copy is 2x the scale traffic.
+            rhs_scale = rhs_scale.astype(jnp.float32)
         if rhs_scale.shape[1] > 1:
             block_size = cfgs.rhs_cfgs.quant_block_size
             num_k_tiles = pl.cdiv(dims.size_k, tiles.tile_k)

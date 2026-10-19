@@ -32,10 +32,22 @@ def test_resident_fp4_is_exact_and_in_gmm_layout():
     n, k = 96, 256
     packed, codes = _random_pair(rng, n, k)
     weight, scale = mxfp4_pair_to_resident_fp4(packed.view(np.int8), codes, key="t")
-    assert weight.dtype == ml_dtypes.float4_e2m1fn and weight.shape == (k, n)
+    assert weight.dtype == ml_dtypes.int4 and weight.shape == (k, n)
     assert scale.dtype == ml_dtypes.bfloat16 and scale.shape == (k // 32, 1, n)
-    got = weight.astype(np.float32) * np.repeat(scale[:, 0, :].astype(np.float32), 32, axis=0)
+    codes4 = weight.astype(np.int8).astype(np.int16) % 16  # back to nibble codes 0..15
+    got = FP4_CODEBOOK[codes4] * np.repeat(scale[:, 0, :].astype(np.float32), 32, axis=0)
     np.testing.assert_array_equal(got, _reference_dequant(packed, codes).T)
+
+
+def test_decode_e2m1_codes_matches_codebook():
+    import jax.numpy as jnp
+
+    from sgl_jax.srt.kernels.gmm.megablox_gmm_kernel.gmm_v2 import decode_e2m1_codes
+
+    codes = np.arange(16, dtype=np.uint8)
+    v = (codes.astype(np.int8) - 16 * (codes >= 8)).astype(ml_dtypes.int4)
+    got = np.asarray(decode_e2m1_codes(jnp.asarray(v), jnp.float32))
+    np.testing.assert_array_equal(got, FP4_CODEBOOK)
 
 
 def test_reserved_scale_code_rejected():
@@ -70,7 +82,10 @@ def test_gmm_v2_fp4_block_scale_matches_dequantized_reference(m_per_group):
     m = groups * m_per_group
     lhs = jnp.asarray(rng.standard_normal((m, k)).astype(np.float32) * 0.05, jnp.bfloat16)
 
-    out = gmm_v2(lhs, rhs, group_sizes, rhs_scale=rhs_scale, preferred_element_type=jnp.float32)
+    out = gmm_v2(
+        lhs, rhs, group_sizes, rhs_scale=rhs_scale, preferred_element_type=jnp.float32,
+        rhs_e2m1_codes=True,
+    )
     out = np.asarray(out, np.float32)
 
     lhs32 = np.asarray(lhs, np.float32)

@@ -34,7 +34,8 @@ _W8A8_DENSE_NAMES = (
 # Resident format for the checkpoint's MXFP4 routed experts:
 #   "fp8": lossless load-time promotion to E4M3 with one scale per output row (default).
 #   "fp4": keep the checkpoint's E2M1 values and per-K32 E8M0 scales as-is; GMM dequantizes
-#          each weight tile to bf16 in VMEM. Halves expert HBM bytes versus "fp8".
+#          each weight tile to bf16 in VMEM. Halves expert HBM bytes versus "fp8". The E2M1
+#          bit codes are held in int4 arrays: Mosaic cannot unpack float4_e2m1fn on v5e/v6e.
 EXPERT_STORAGE = os.environ.get("SGLJAX_DSV4_EXPERT_STORAGE", "fp8")
 if EXPERT_STORAGE not in ("fp8", "fp4"):
     raise ValueError(f"SGLJAX_DSV4_EXPERT_STORAGE must be fp8 or fp4, got {EXPERT_STORAGE!r}")
@@ -51,6 +52,11 @@ class DeepseekV4EPMoE(EPMoE):
             raise ValueError("swiglu_limit requires a finite positive limit")
         super().__init__(*args, **kwargs)
         self.swiglu_limit = swiglu_limit
+
+    def _call_gmm(self, **kwargs):
+        if self.wi_0.value.dtype == jnp.int4 and EXPERT_STORAGE == "fp4":
+            kwargs["rhs_e2m1_codes"] = True
+        return super()._call_gmm(**kwargs)
 
     def _apply_activation(self, layer_w0, layer_w1):
         if self.swiglu_limit is None:
@@ -221,7 +227,7 @@ class DeepseekV4MoE(nnx.Module):
             if self.experts.replicate_experts:
                 raise ValueError("V4 resident FP8 experts require moe_dp_size=1")
             fp4 = EXPERT_STORAGE == "fp4"
-            weight_dtype = jnp.float4_e2m1fn if fp4 else jnp.float8_e4m3fn
+            weight_dtype = jnp.int4 if fp4 else jnp.float8_e4m3fn
             self.experts.quantized_dtype = weight_dtype
             # FP4 keeps per-K32 block scales, which GMM reads as [E, K/32, 1, N].
             self.experts.weight_block_size = (MXFP4_BLOCK, MXFP4_BLOCK) if fp4 else None
