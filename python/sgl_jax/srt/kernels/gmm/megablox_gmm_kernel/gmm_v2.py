@@ -871,7 +871,9 @@ def make_gmm_configs(
     )
 
     lhs_q_dtype = None
-    if maybe_quantize_lhs and rhs_quant_dtype is not None:
+    # FP4 weights are dequantized to bf16 in VMEM (W4A16); Mosaic has no f8 x f4 matmul.
+    rhs_is_fp4 = rhs_quant_dtype is not None and jax.dtypes.itemsize_bits(rhs_quant_dtype) == 4
+    if maybe_quantize_lhs and rhs_quant_dtype is not None and not rhs_is_fp4:
         # Choose lhs quantization dtype based on TPU hardware support.
         is_rhs_float = jnp.issubdtype(rhs_quant_dtype, jnp.floating)
         tpu_info = pltpu.get_tpu_info()
