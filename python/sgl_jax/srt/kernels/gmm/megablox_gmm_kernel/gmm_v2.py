@@ -233,7 +233,17 @@ def inner_kernel(
         )
 
         if cfgs.lhs_cfgs.quant_dtype is None:
-            if is_block_rhs_scale:
+            if is_block_rhs_scale and jax.dtypes.itemsize_bits(tiled_rhs.dtype) == 4:
+                # W4A16 with fine block scales (MXFP4 K32): per-block matmuls would be K=32
+                # wide, so dequantize the whole tile in VMEM and run one full-K matmul.
+                tile_k, tile_n = tiled_rhs.shape
+                scale = tiled_rhs_ref.scale[...].astype(tiled_lhs.dtype)  # [tile_k/blk, 1, tn]
+                w = tiled_rhs.astype(tiled_lhs.dtype).reshape(tile_k // rhs_block, rhs_block, tile_n)
+                w = (w * scale).reshape(tile_k, tile_n)
+                acc = jnp.matmul(
+                    tiled_lhs, w, preferred_element_type=jnp.float32
+                ).astype(acc_ref.dtype)
+            elif is_block_rhs_scale:
                 # W8A16 block-wise weight scale: split K by rhs_block, each block × its scale.
                 acc = jnp.zeros((cfgs.tiles.tile_m, cfgs.tiles.tile_n), dtype=acc_ref.dtype)
                 for blk_i, start_k in enumerate(range(0, cfgs.tiles.tile_k, rhs_block)):

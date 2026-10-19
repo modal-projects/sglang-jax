@@ -233,6 +233,48 @@ def _assign(param, value, key: str, *, mesh: jax.sharding.Mesh) -> None:
     param.value.block_until_ready()
 
 
+def mxfp4_pair_to_resident_fp4(packed: np.ndarray, codes: np.ndarray, *, key: str):
+    """Checkpoint MXFP4 pair -> GMM layout without changing any value.
+
+    packed: [N, K/2] bytes, two E2M1 values per byte along K, low nibble first.
+    codes:  [N, K/32] E8M0 exponent codes, one per 32 consecutive K values.
+    Returns weight [K, N] float4_e2m1fn and scale [K/32, 1, N] bf16 (powers of two, exact).
+    """
+    packed = np.ascontiguousarray(packed).view(np.uint8)
+    codes = np.ascontiguousarray(codes).view(np.uint8)
+    n, half_k = packed.shape
+    if codes.shape != (n, 2 * half_k // 32):
+        raise ValueError(f"{key}: scale shape {codes.shape} does not match weight {packed.shape}")
+    if np.any(codes == 255):
+        raise ValueError(f"{key}: reserved F8_E8M0 scale code 255")
+    nibbles = np.empty((n, 2 * half_k), np.uint8)
+    nibbles[:, 0::2] = packed & np.uint8(0x0F)
+    nibbles[:, 1::2] = packed >> np.uint8(4)
+    # E2M1 nibble codes are exactly float4_e2m1fn's bit patterns.
+    weight = nibbles.view(ml_dtypes.float4_e2m1fn).T
+    scale = np.ldexp(np.ones(codes.shape, np.float32), codes.astype(np.int16) - 127)
+    return np.ascontiguousarray(weight), scale.astype(ml_dtypes.bfloat16).T[:, None, :]
+
+
+def _put_expert_rows(buffers, physical_id: int, stem: str, values: dict[bool, np.ndarray]):
+    """Write one expert's decoded weight and scale into every local shard that owns it."""
+    for param, is_scale, _, shards in buffers:
+        value = values[is_scale]
+        if value.shape != param.value.shape[1:]:
+            raise ValueError(f"{stem}: decoded expert shape {value.shape} != {param.value.shape[1:]}")
+        for device, shard in shards.items():
+            index, array, update = shard
+            owned = range(*index[0].indices(param.value.shape[0]))
+            if physical_id not in owned:
+                continue
+            placement = SingleDeviceSharding(device)
+            row = jax.device_put(
+                np.ascontiguousarray(value[index[1:]], dtype=param.value.dtype), placement
+            )
+            offset = jax.device_put(np.int32(owned.index(physical_id)), placement)
+            shard[1] = _on_device(update, device, array, row, offset)
+
+
 def _e8m0_scale(entry: dict, key: str, *, source=None) -> np.ndarray:
     codes = _read(entry, np.uint8, source=source, key=key)
     if np.any(codes == 255):
@@ -463,48 +505,44 @@ def load_moe_weights(
             stem = prefix + f"experts.{expert_id}.{source}"
             wk, sk = stem + ".weight", stem + ".scale"
             weight_entry, scale_entry = assigned[wk][0], assigned[sk][0]
-            with (
-                open(weight_entry["file"], "rb") as weight_source,
-                open(scale_entry["file"], "rb") as scale_source,
-            ):
-                converted = convert_mxfp4_pair_from_reader(
-                    weight_name=wk,
-                    scale_name=sk,
-                    weight_shape=weight_entry["shape"],
-                    scale_shape=scale_entry["shape"],
-                    weight_dtype=weight_entry["dtype"],
-                    scale_dtype=scale_entry["dtype"],
-                    read_weight_rows=lambda rows, source=weight_source, entry=weight_entry: _read_rows(
-                        source, entry, rows
-                    ),
-                    read_scale_rows=lambda rows, source=scale_source, entry=scale_entry: _read_rows(
-                        source, entry, rows
-                    ),
-                    row_chunk_size=row_chunk_size,
-                    strict=True,
+            if weight_param.value.dtype == jnp.float4_e2m1fn:
+                with (
+                    open(weight_entry["file"], "rb") as weight_source,
+                    open(scale_entry["file"], "rb") as scale_source,
+                ):
+                    packed = _read_rows(weight_source, weight_entry, slice(None))
+                    codes = _read_rows(scale_source, scale_entry, slice(None))
+                values = mxfp4_pair_to_resident_fp4(packed, codes, key=wk)
+            else:
+                with (
+                    open(weight_entry["file"], "rb") as weight_source,
+                    open(scale_entry["file"], "rb") as scale_source,
+                ):
+                    converted = convert_mxfp4_pair_from_reader(
+                        weight_name=wk,
+                        scale_name=sk,
+                        weight_shape=weight_entry["shape"],
+                        scale_shape=scale_entry["shape"],
+                        weight_dtype=weight_entry["dtype"],
+                        scale_dtype=scale_entry["dtype"],
+                        read_weight_rows=lambda rows, source=weight_source, entry=weight_entry: _read_rows(
+                            source, entry, rows
+                        ),
+                        read_scale_rows=lambda rows, source=scale_source, entry=scale_entry: _read_rows(
+                            source, entry, rows
+                        ),
+                        row_chunk_size=row_chunk_size,
+                        strict=True,
+                    )
+                weight, scale = converted.weight_fp8, converted.scale_fp32
+                max_error = max(max_error, converted.report.max_abs_error)
+                peak_host_bytes = max(
+                    peak_host_bytes, converted.report.calculated_peak_host_bytes
                 )
-            weight, scale = converted.weight_fp8, converted.scale_fp32
+                values = (weight.T, scale[None, None, :])
             converted_pairs += 1
-            max_error = max(max_error, converted.report.max_abs_error)
-            peak_host_bytes = max(peak_host_bytes, converted.report.calculated_peak_host_bytes)
             local_payload_keys.update((wk, sk))
-            for param, is_scale, _, shards in buffers:
-                value = scale[None, None, :] if is_scale else weight.T
-                if value.shape != param.value.shape[1:]:
-                    raise ValueError(
-                        f"{stem}: decoded expert shape {value.shape} != {param.value.shape[1:]}"
-                    )
-                for device, shard in shards.items():
-                    index, array, update = shard
-                    owned = range(*index[0].indices(param.value.shape[0]))
-                    if physical_id not in owned:
-                        continue
-                    placement = SingleDeviceSharding(device)
-                    row = jax.device_put(
-                        np.ascontiguousarray(value[index[1:]], dtype=param.value.dtype), placement
-                    )
-                    offset = jax.device_put(np.int32(owned.index(physical_id)), placement)
-                    shard[1] = _on_device(update, device, array, row, offset)
+            _put_expert_rows(buffers, physical_id, stem, {False: values[0], True: values[1]})
             for _, _, _, shards in buffers:
                 for _, array, _ in shards.values():
                     array.block_until_ready()

@@ -31,6 +31,14 @@ _W8A8_DENSE_NAMES = (
     if _W8A8_DENSE_NAMES_ENV
     else None
 )
+# Resident format for the checkpoint's MXFP4 routed experts:
+#   "fp8": lossless load-time promotion to E4M3 with one scale per output row (default).
+#   "fp4": keep the checkpoint's E2M1 values and per-K32 E8M0 scales as-is; GMM dequantizes
+#          each weight tile to bf16 in VMEM. Halves expert HBM bytes versus "fp8".
+EXPERT_STORAGE = os.environ.get("SGLJAX_DSV4_EXPERT_STORAGE", "fp8")
+if EXPERT_STORAGE not in ("fp8", "fp4"):
+    raise ValueError(f"SGLJAX_DSV4_EXPERT_STORAGE must be fp8 or fp4, got {EXPERT_STORAGE!r}")
+MXFP4_BLOCK = 32
 
 
 class DeepseekV4EPMoE(EPMoE):
@@ -212,16 +220,22 @@ class DeepseekV4MoE(nnx.Module):
         if getattr(config, "expert_dtype", None) == "fp4":
             if self.experts.replicate_experts:
                 raise ValueError("V4 resident FP8 experts require moe_dp_size=1")
-            self.experts.quantized_dtype = jnp.float8_e4m3fn
-            self.experts.weight_block_size = None
+            fp4 = EXPERT_STORAGE == "fp4"
+            weight_dtype = jnp.float4_e2m1fn if fp4 else jnp.float8_e4m3fn
+            self.experts.quantized_dtype = weight_dtype
+            # FP4 keeps per-K32 block scales, which GMM reads as [E, K/32, 1, N].
+            self.experts.weight_block_size = (MXFP4_BLOCK, MXFP4_BLOCK) if fp4 else None
             with jax.sharding.use_abstract_mesh(self.experts.updated_mesh):
                 for name in ("wi_0", "wi_1", "wo"):
                     old = getattr(self.experts, name).value
                     spec = jax.typeof(old).sharding.spec
+                    if fp4 and self.experts.tp_size != 1:
+                        raise ValueError("FP4 expert storage requires ep_size == world size")
+                    k_blocks = old.shape[1] // MXFP4_BLOCK if fp4 else 1
                     setattr(
                         self.experts,
                         name,
-                        nnx.Param(jnp.zeros(old.shape, jnp.float8_e4m3fn, out_sharding=spec)),
+                        nnx.Param(jnp.zeros(old.shape, weight_dtype, out_sharding=spec)),
                     )
                     setattr(
                         self.experts,
@@ -229,8 +243,8 @@ class DeepseekV4MoE(nnx.Module):
                         nnx.data(
                             nnx.Param(
                                 jnp.ones(
-                                    (old.shape[0], 1, 1, old.shape[2]),
-                                    jnp.float32,
+                                    (old.shape[0], k_blocks, 1, old.shape[2]),
+                                    jnp.bfloat16 if fp4 else jnp.float32,
                                     out_sharding=P(spec[0], None, None, spec[2]),
                                 )
                             )
