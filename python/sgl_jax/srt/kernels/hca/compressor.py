@@ -375,7 +375,8 @@ def _hca_project_fused(
         ),
         out_shape=jax.ShapeDtypeStruct(output_shape, jnp.float32),
         compiler_params=pltpu.CompilerParams(
-            dimension_semantics=("parallel", "parallel", "arbitrary")
+            dimension_semantics=("parallel", "parallel", "arbitrary"),
+            vmem_limit_bytes=schedule.vmem_budget_bytes,
         ),
         interpret=_interpret_pallas(),
         name=f"hca-state-project-b{tile_b}-k{tile_k}-n{output_width}",

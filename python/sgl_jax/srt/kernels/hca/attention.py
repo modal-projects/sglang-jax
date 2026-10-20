@@ -1427,6 +1427,7 @@ def _chunk_attention(
             # prefetch depends on.
             dimension_semantics=("arbitrary",),
             disable_bounds_checks=True,
+            vmem_limit_bytes=schedule.vmem_budget_bytes,
         ),
         interpret=interpret,
         name=f"hca-chunk-prefill-q{queries_per_block}-c{compressed_tile}",
