@@ -190,7 +190,8 @@ def token_compress_prefill_pallas(
         grid_spec=grid_spec,
         out_shape=jax.ShapeDtypeStruct((batch, num_entries, head_dim), out_dtype),
         compiler_params=pltpu.CompilerParams(
-            dimension_semantics=("parallel", "parallel", "arbitrary")
+            dimension_semantics=("parallel", "parallel", "arbitrary"),
+            vmem_limit_bytes=schedule.vmem_budget_bytes,
         ),
         interpret=_interpret_pallas() if interpret is None else interpret,
         name=f"hca-prefill-r128-m{token_tile}-k{tile_k}-n512",
