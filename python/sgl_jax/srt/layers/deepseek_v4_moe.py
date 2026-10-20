@@ -62,6 +62,14 @@ class DeepseekV4EPMoE(EPMoE):
             kwargs["rhs_fp4_packed"] = True
         return super()._call_gmm(**kwargs)
 
+    def quantize_weights(self, is_static: bool = False, *, abstract: bool = False):
+        # Resident FP4 storage already created its weights and K32 scales; the generic static
+        # placeholder pass would rebuild scales from packed/int4 weight shapes (K/8 rows) and give
+        # the dummy loader, which keeps placeholder shapes, mismatched scales.
+        if is_static and self.wi_0.value.dtype in (jnp.uint32, jnp.int4):
+            return
+        return super().quantize_weights(is_static, abstract=abstract)
+
     def _normalize_scale_for_gmm(self, scale, weight, *, scale_name):
         if weight.dtype == jnp.uint32:
             # Packed FP4: weight rows are K/8; scales are created as GMM v2 scale_2d rows [E, K/32, N].
