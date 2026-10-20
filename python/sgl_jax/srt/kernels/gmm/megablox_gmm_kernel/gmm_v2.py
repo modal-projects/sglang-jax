@@ -75,6 +75,12 @@ class InputConfigs:
 FP4_PACK_CHUNK = 64  # K rows per packing chunk: 8 packed uint32 rows -> 32 low + 32 high nibble rows
 FP4_PACKED_SCALE_EXP = 14  # expansion yields value * 2**-14; the caller's K32 scales carry 2**14
 FP4_PACKED_MAX_TILE_M = 32
+# Prefill: with at least this many rows, expand each weight tile once, apply the K32 scales to the
+# weights in bf16 (exact: power-of-two scale x E2M1 value) and run one full-K matmul per tile with
+# a large tile_m. The decode path (K32 block dots, tile_m <= 32) caps out near ~47 TF on v5e.
+FP4_PACKED_FULL_K_MIN_M = 512
+FP4_PACKED_FULL_K_TILE_M = 256
+FP4_PACKED_FULL_K_MAX_TILE_N = 512
 
 
 def expand_fp4_packed_e5m2(words: jax.Array) -> jax.Array:
@@ -305,22 +311,33 @@ def inner_kernel(
 
         if cfgs.lhs_cfgs.quant_dtype is None:
             if cfgs.rhs_cfgs.fp4_packed:
-                # W4A16 MXFP4, exact: expand packed FP4 to E5M2 in VMEM (v6e's fast FP8 MXU format),
-                # then one K32-wide matmul per scale block, scaled on the f32 output.
+                # W4A16 MXFP4, exact: expand packed FP4 to E5M2 in VMEM (v6e's fast FP8 MXU format).
                 assert is_block_rhs_scale and rhs_block == 32 and valid_k == 0
+                tile_k, tile_n = cfgs.tiles.tile_k, cfgs.tiles.tile_n
                 w = expand_fp4_packed_e5m2(tiled_rhs)
-                acc = jnp.zeros((cfgs.tiles.tile_m, cfgs.tiles.tile_n), dtype=acc_ref.dtype)
-                for blk_i in range(cfgs.tiles.tile_k // rhs_block):
-                    lo_k = blk_i * rhs_block
-                    part = jnp.matmul(
-                        tiled_lhs[:, lo_k : lo_k + rhs_block],
-                        w[lo_k : lo_k + rhs_block],
-                        preferred_element_type=jnp.float32,
-                    )
-                    if cfgs.rhs_cfgs.scale_2d:
-                        acc += part * tiled_rhs_ref.scale[blk_i : blk_i + 1, :]
-                    else:
-                        acc += part * tiled_rhs_ref.scale[blk_i, 0:1, :]
+                if cfgs.tiles.tile_m > FP4_PACKED_MAX_TILE_M:
+                    # Prefill: scale the expanded weights in bf16 (exact: power-of-two scale x
+                    # E2M1 value) and run one full-K matmul.
+                    scale = tiled_rhs_ref.scale[...].astype(jnp.bfloat16)
+                    w = w.astype(jnp.bfloat16).reshape(tile_k // rhs_block, rhs_block, tile_n)
+                    w = (w * scale.reshape(tile_k // rhs_block, 1, tile_n)).reshape(tile_k, tile_n)
+                    acc = jnp.matmul(
+                        tiled_lhs.astype(jnp.bfloat16), w, preferred_element_type=jnp.float32
+                    ).astype(acc_ref.dtype)
+                else:
+                    # Decode: one K32-wide matmul per scale block, scaled on the f32 output.
+                    acc = jnp.zeros((cfgs.tiles.tile_m, tile_n), dtype=acc_ref.dtype)
+                    for blk_i in range(tile_k // rhs_block):
+                        lo_k = blk_i * rhs_block
+                        part = jnp.matmul(
+                            tiled_lhs[:, lo_k : lo_k + rhs_block],
+                            w[lo_k : lo_k + rhs_block],
+                            preferred_element_type=jnp.float32,
+                        )
+                        if cfgs.rhs_cfgs.scale_2d:
+                            acc += part * tiled_rhs_ref.scale[blk_i : blk_i + 1, :]
+                        else:
+                            acc += part * tiled_rhs_ref.scale[blk_i, 0:1, :]
             elif cfgs.rhs_cfgs.e2m1_codes:
                 # W4A16 MXFP4: per-block matmuls would be K=32 wide, so dequantize the whole
                 # tile in VMEM (E2M1 decode x per-K32 scale) and run one full-K matmul.
@@ -1019,7 +1036,14 @@ def make_gmm_configs(
         lhs_q_dtype = lhs_q_dtype if lhs_q_dtype is not None else lhs.dtype
         rhs_tile_dtype = jnp.int4 if rhs_fp4_packed else rhs.dtype
         tiles = tile_info(lhs_q_dtype, rhs_tile_dtype, dims, vmem_limit_bytes)
-        if rhs_fp4_packed and tiles.tile_m > FP4_PACKED_MAX_TILE_M:
+        if rhs_fp4_packed and dims.size_m >= FP4_PACKED_FULL_K_MIN_M:
+            # Prefill: full-K scaled-weight path (tile_m > FP4_PACKED_MAX_TILE_M selects it).
+            tiles = dataclasses.replace(
+                tiles,
+                tile_m=FP4_PACKED_FULL_K_TILE_M,
+                tile_n=min(tiles.tile_n, FP4_PACKED_FULL_K_MAX_TILE_N),
+            )
+        elif rhs_fp4_packed and tiles.tile_m > FP4_PACKED_MAX_TILE_M:
             # The K32 block-dot loop's cost grows with rows per tile: on v5e/v6e tile_m > 32 is
             # 1.7-2x slower at 48-96 rows/device (fp4p_tile_sweep), while <= 32 rows is unaffected.
             tiles = dataclasses.replace(tiles, tile_m=FP4_PACKED_MAX_TILE_M)

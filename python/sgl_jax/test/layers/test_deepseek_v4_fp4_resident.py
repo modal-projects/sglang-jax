@@ -134,7 +134,9 @@ def test_packed_fp4_is_exact_and_in_gmm_layout():
 
 @pytest.mark.skipif(os.environ.get("JAX_PLATFORMS", "") == "cpu", reason="GMM v2 needs a TPU")
 @pytest.mark.parametrize("scale_layout", ["rows", "4d", "rows-bf16"])
-@pytest.mark.parametrize("m_per_group", [1, 7, 64, 300])
+# m = 4 * m_per_group: 256 rows and below take the K32 block-dot path, 1200 and 2800 the full-K
+# prefill path (FP4_PACKED_FULL_K_MIN_M).
+@pytest.mark.parametrize("m_per_group", [1, 7, 64, 300, 700])
 def test_gmm_v2_fp4_packed_matches_dequantized_reference(m_per_group, scale_layout):
     import jax
     import jax.numpy as jnp
