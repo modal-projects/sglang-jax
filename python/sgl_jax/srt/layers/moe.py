@@ -610,6 +610,11 @@ class EPMoE(nnx.Module):
                 scale_name="wo_scale",
             )
 
+            def _scale_spec(scale, out_axis):
+                if scale is not None and scale.ndim == 3:
+                    return P("expert", None, out_axis)
+                return P("expert", None, None, out_axis)
+
             result = shard_map(
                 partial(
                     self._forward,
@@ -625,10 +630,10 @@ class EPMoE(nnx.Module):
                     P("expert", None, "tensor"),
                     P("expert", None, "tensor"),
                     P("expert", "tensor", None),
-                    # scales [g, 1, 1, n]
-                    P("expert", None, None, "tensor"),
-                    P("expert", None, None, "tensor"),
-                    P("expert", None, None, None),
+                    # scales [g, k_blocks, 1, n], or row layout [g, k_blocks, n] (packed FP4)
+                    _scale_spec(w0_scale, "tensor"),
+                    _scale_spec(w1_scale, "tensor"),
+                    _scale_spec(wo_scale, None),
                     # biases [g, 1, n] (unused)
                     P("expert", None, "tensor"),
                     P("expert", None, "tensor"),
