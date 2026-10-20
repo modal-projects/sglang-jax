@@ -18,7 +18,8 @@ class CSAAttentionSchedule:
 
 
 def get_csa_attention_schedule(device_kind: str, *, decode: bool = False):
-    if not any(s in device_kind.lower() for s in ("v6e", "v6 lite")):
+    # v5e shares v6e's (8, 128) native tiling; unblocked there, not tuned.
+    if not any(s in device_kind.lower() for s in ("v6e", "v6 lite", "v5e", "v5 lite")):
         raise ValueError(f"No validated CSA schedule for {device_kind!r}")
     # Decode writes isolated rows; one native BF16 tile avoids padded writer groups.
     native_rows = pltpu.Tiling.COMPACT.shape[0] * (

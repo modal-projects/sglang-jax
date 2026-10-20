@@ -156,10 +156,12 @@ _PLATFORMS += (
 )
 
 
-# v5e (device_kind "TPU v5 lite") reuses the v6e schedule unchanged: same 128 MiB VMEM and
-# 128-lane geometry. Unblock only -- not measured or tuned on v5e.
+# v5e (device_kind "TPU v5 lite"): v6e's 128-lane geometry and tiles, but Mosaic's default scoped
+# VMEM is 16 MiB (v6e: 32 MiB); kernels without an explicit limit fail prefill compile at 32 MiB.
 _PLATFORMS += (
-    replace(_PLATFORMS[0], name="TPU v5e", device_markers=("v5e", "v5 lite")),
+    replace(
+        _PLATFORMS[0], name="TPU v5e", device_markers=("v5e", "v5 lite"), vmem_bytes=16 * 1024 * 1024
+    ),
 )
 
 def _platform_parameters(device_kind: str) -> _HCAPlatformParameters:
