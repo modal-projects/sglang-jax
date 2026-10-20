@@ -85,6 +85,9 @@ def _kernel(
         out_ref[...] = (acc_sc[...] / l_sc[...]).astype(out_ref.dtype)
 
 
+_MAX_BLOCK_ROWS = 2048
+
+
 def csa_flash_attention(
     q,
     keys,
@@ -108,7 +111,9 @@ def csa_flash_attention(
             f"shape mismatch: q{q.shape} keys{keys.shape} mask{mask.shape} sink{sink.shape}"
         )
     kdt = keys.dtype if keys.dtype in (jnp.bfloat16, jnp.float32) else jnp.bfloat16
-    tq = min(block_q, -(-T // 8) * 8)
+    # Query rows per block are tq * H (f32 accumulator, output window, q block): cap them so
+    # unsharded heads (TP=1: all 64 on one chip) stay inside VMEM.
+    tq = min(block_q, -(-T // 8) * 8, max(8, _MAX_BLOCK_ROWS // H // 8 * 8))
     tk = min(block_k, -(-N // 128) * 128)
     Tp = -(-T // tq) * tq
     Np = -(-N // tk) * tk
