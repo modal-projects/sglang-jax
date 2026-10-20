@@ -66,6 +66,30 @@ class InputConfigs:
     has_scale: bool = False
     # rhs is int4 holding E2M1 (FP4) bit codes, dequantized to bf16 in VMEM (W4A16).
     e2m1_codes: bool = False
+    # rhs is packed MXFP4 (uint32 [G, K/8, N], see expand_fp4_packed_e5m2), expanded to E5M2 in VMEM.
+    fp4_packed: bool = False
+
+
+FP4_PACK_CHUNK = 64  # K rows per packing chunk: 8 packed uint32 rows -> 32 low + 32 high nibble rows
+FP4_PACKED_SCALE_EXP = 14  # expansion yields value * 2**-14; the caller's K32 scales carry 2**14
+
+
+def expand_fp4_packed_e5m2(words: jax.Array) -> jax.Array:
+    """Packed E2M1 -> E5M2, exactly, with SWAR mask/shift (4 values per 32-bit op).
+
+    words: uint32 [tk/8, tn]. In each 64-row K chunk c (packed rows 8c..8c+7, j = row % 8), byte b of
+    a word holds K row 64c + 4j + b in its low nibble and K row 64c + 32 + 4j + b in its high nibble.
+    For E2M1 code s|ee|m, the E5M2 byte s<<7 | ee<<2 | m<<1 equals value * 2**-14 (zero and the
+    0.5 subnormal included). Returns E5M2 [tk, tn] in natural K order.
+    """
+    tk8, tn = words.shape
+    nc = tk8 // 8
+    def to_e5m2(x):
+        b = ((x & jnp.uint32(0x08080808)) << 4) | ((x & jnp.uint32(0x07070707)) << 1)
+        return pltpu.bitcast(b, jnp.float8_e5m2).reshape(nc, 32, tn)
+    lo = to_e5m2(words & jnp.uint32(0x0F0F0F0F))
+    hi = to_e5m2((words >> 4) & jnp.uint32(0x0F0F0F0F))
+    return jnp.concatenate([lo, hi], axis=1).reshape(nc * FP4_PACK_CHUNK, tn)
 
 
 E2M1_DECODE = os.environ.get("SGLJAX_E2M1_DECODE", "bits")
@@ -173,7 +197,7 @@ def generate_block_specs(
     )
 
     rhs_weight_spec = pl.BlockSpec(
-        (None, cfgs.tiles.tile_k, cfgs.tiles.tile_n),
+        (None, cfgs.tiles.tile_k // (8 if cfgs.rhs_cfgs.fp4_packed else 1), cfgs.tiles.tile_n),
         index_map.rhs_weight_index_map,
         pipeline_mode=pl.Buffered(buffer_count=3),
     )
@@ -267,7 +291,21 @@ def inner_kernel(
         )
 
         if cfgs.lhs_cfgs.quant_dtype is None:
-            if cfgs.rhs_cfgs.e2m1_codes:
+            if cfgs.rhs_cfgs.fp4_packed:
+                # W4A16 MXFP4, exact: expand packed FP4 to E5M2 in VMEM (v6e's fast FP8 MXU format),
+                # then one K32-wide matmul per scale block, scaled on the f32 output.
+                assert is_block_rhs_scale and rhs_block == 32 and valid_k == 0
+                w = expand_fp4_packed_e5m2(tiled_rhs)
+                acc = jnp.zeros((cfgs.tiles.tile_m, cfgs.tiles.tile_n), dtype=acc_ref.dtype)
+                for blk_i in range(cfgs.tiles.tile_k // rhs_block):
+                    lo_k = blk_i * rhs_block
+                    part = jnp.matmul(
+                        tiled_lhs[:, lo_k : lo_k + rhs_block],
+                        w[lo_k : lo_k + rhs_block],
+                        preferred_element_type=jnp.float32,
+                    )
+                    acc += part * tiled_rhs_ref.scale[blk_i, 0:1, :]
+            elif cfgs.rhs_cfgs.e2m1_codes:
                 # W4A16 MXFP4: per-block matmuls would be K=32 wide, so dequantize the whole
                 # tile in VMEM (E2M1 decode x per-K32 scale) and run one full-K matmul.
                 assert is_block_rhs_scale, "E2M1 codes require block-wise rhs_scale"
@@ -793,11 +831,16 @@ def validate_inputs(
     rhs_bias: jax.Array | None,
     group_sizes: jax.Array,
     group_offset: jax.Array,
+    rhs_fp4_packed: bool = False,
 ):
     """Validates the inputs for the GMM kernel."""
 
     size_m = lhs.shape[0]
     size_group, size_k, size_n = rhs.shape
+    if rhs_fp4_packed:
+        assert rhs.dtype == jnp.uint32, rhs.dtype
+        size_k *= 8
+        rhs = jax.ShapeDtypeStruct((size_group, size_k, size_n), rhs.dtype)
     size_lhs_group = group_sizes.shape[0]
 
     assert size_group <= size_lhs_group
@@ -846,9 +889,8 @@ def get_cost_estimate(
 
     lhs_bytes = dims.size_m * dims.size_k * lhs.dtype.itemsize
 
-    rhs_bytes = (
-        dims.size_group * dims.size_k * dims.size_n * jax.dtypes.itemsize_bits(rhs.weight)
-    ) // 8
+    rhs_bits = 4 if rhs.weight.dtype == jnp.uint32 else jax.dtypes.itemsize_bits(rhs.weight)
+    rhs_bytes = (dims.size_group * dims.size_k * dims.size_n * rhs_bits) // 8
     if rhs.scale is not None:
         rhs_bytes += dims.size_n * jnp.dtype(jnp.float32).itemsize
     if rhs.bias is not None:
@@ -887,10 +929,13 @@ def make_gmm_configs(
     maybe_quantize_lhs: bool,
     zero_initialize: bool,
     rhs_e2m1_codes: bool = False,
+    rhs_fp4_packed: bool = False,
 ):
     """Fills the GMM config for the GMM kernel."""
 
-    dims = validate_inputs(lhs, rhs, rhs_scale, rhs_bias, group_sizes, group_offset)
+    dims = validate_inputs(
+        lhs, rhs, rhs_scale, rhs_bias, group_sizes, group_offset, rhs_fp4_packed=rhs_fp4_packed
+    )
 
     if rhs_scale is not None:
         has_scale = True
@@ -908,11 +953,12 @@ def make_gmm_configs(
         has_bias=rhs_bias is not None,
         has_scale=has_scale,
         e2m1_codes=rhs_e2m1_codes,
+        fp4_packed=rhs_fp4_packed,
     )
 
     lhs_q_dtype = None
     # E2M1-coded weights are dequantized to bf16 in VMEM (W4A16): never quantize lhs for them.
-    if maybe_quantize_lhs and rhs_quant_dtype is not None and not rhs_e2m1_codes:
+    if maybe_quantize_lhs and rhs_quant_dtype is not None and not (rhs_e2m1_codes or rhs_fp4_packed):
         # Choose lhs quantization dtype based on TPU hardware support.
         is_rhs_float = jnp.issubdtype(rhs_quant_dtype, jnp.floating)
         tpu_info = pltpu.get_tpu_info()
@@ -951,7 +997,10 @@ def make_gmm_configs(
         tiles = tile_info
     else:
         lhs_q_dtype = lhs_q_dtype if lhs_q_dtype is not None else lhs.dtype
-        tiles = tile_info(lhs_q_dtype, rhs.dtype, dims, vmem_limit_bytes)
+        rhs_tile_dtype = jnp.int4 if rhs_fp4_packed else rhs.dtype
+        tiles = tile_info(lhs_q_dtype, rhs_tile_dtype, dims, vmem_limit_bytes)
+    if rhs_fp4_packed:
+        assert tiles.tile_k % FP4_PACK_CHUNK == 0 and dims.size_k % tiles.tile_k == 0, tiles
 
     return GmmConfigs(
         dims=dims,
@@ -987,6 +1036,7 @@ def get_metadata(cfgs: GmmConfigs):
         "maybe_quantize_lhs",
         "zero_initialize",
         "rhs_e2m1_codes",
+        "rhs_fp4_packed",
     ]
 )
 def gmm_v2(
@@ -1005,6 +1055,7 @@ def gmm_v2(
     maybe_quantize_lhs: bool = True,
     zero_initialize: bool = True,
     rhs_e2m1_codes: bool = False,
+    rhs_fp4_packed: bool = False,
 ) -> jax.Array:
     """GMM kernel implemented with emit_pipeline.
 
@@ -1056,6 +1107,7 @@ def gmm_v2(
         maybe_quantize_lhs=maybe_quantize_lhs,
         zero_initialize=zero_initialize,
         rhs_e2m1_codes=rhs_e2m1_codes,
+        rhs_fp4_packed=rhs_fp4_packed,
     )
     dims = cfgs.dims
     tiles = cfgs.tiles

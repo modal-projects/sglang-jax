@@ -102,3 +102,65 @@ def test_gmm_v2_fp4_block_scale_matches_dequantized_reference(m_per_group):
     # Weights are exact in bf16 after scaling; the only error is bf16 rounding of w*scale
     # products being exact (powers of two) and f32 accumulation order.
     np.testing.assert_allclose(out, want, rtol=2e-2, atol=2e-2 * np.abs(want).max())
+
+
+def _emulate_packed_expand(words: np.ndarray) -> np.ndarray:
+    """numpy model of gmm_v2.expand_fp4_packed_e5m2 (returns the E2M1 values, not x 2**-14)."""
+    k8, n = words.shape
+    out = np.empty((k8 * 8, n), np.float32)
+    for r in range(k8):
+        c, j = divmod(r, 8)
+        for b in range(4):
+            byte = (words[r] >> (8 * b)) & 0xFF
+            out[64 * c + 4 * j + b] = FP4_CODEBOOK[byte & 0xF]
+            out[64 * c + 32 + 4 * j + b] = FP4_CODEBOOK[byte >> 4]
+    return out
+
+
+def test_packed_fp4_is_exact_and_in_gmm_layout():
+    from sgl_jax.srt.kernels.gmm.megablox_gmm_kernel.gmm_v2 import FP4_PACKED_SCALE_EXP
+    from sgl_jax.srt.layers.deepseek_v4_moe_loader import mxfp4_pair_to_packed_fp4
+
+    rng = np.random.default_rng(3)
+    n, k = 40, 256
+    packed, codes = _random_pair(rng, n, k)
+    words, scale = mxfp4_pair_to_packed_fp4(packed, codes, key="t")
+    assert words.dtype == np.uint32 and words.shape == (k // 8, n)
+    assert scale.dtype == np.float32 and scale.shape == (k // 32, 1, n)
+    vals = _emulate_packed_expand(words)
+    got = vals * np.repeat(scale[:, 0, :], 32, axis=0) * np.float32(2.0**-FP4_PACKED_SCALE_EXP)
+    np.testing.assert_array_equal(got, _reference_dequant(packed, codes).T)
+
+
+@pytest.mark.skipif(os.environ.get("JAX_PLATFORMS", "") == "cpu", reason="GMM v2 needs a TPU")
+@pytest.mark.parametrize("m_per_group", [1, 7, 64, 300])
+def test_gmm_v2_fp4_packed_matches_dequantized_reference(m_per_group):
+    import jax
+    import jax.numpy as jnp
+
+    from sgl_jax.srt.kernels.gmm.megablox_gmm_backend import gmm
+    from sgl_jax.srt.layers.deepseek_v4_moe_loader import mxfp4_pair_to_packed_fp4
+
+    if jax.devices()[0].platform != "tpu":
+        pytest.skip("needs TPU")
+    rng = np.random.default_rng(4)
+    groups, k, n = 4, 4096, 2048
+    ws, ss, refs = [], [], []
+    for _ in range(groups):
+        packed, codes = _random_pair(rng, n, k)
+        w, s = mxfp4_pair_to_packed_fp4(packed, codes, key="t")
+        ws.append(w)
+        ss.append(s)
+        refs.append(_reference_dequant(packed, codes).T)
+    m = groups * m_per_group
+    lhs = jnp.asarray(rng.standard_normal((m, k)).astype(np.float32) * 0.05, jnp.bfloat16)
+    out = gmm(
+        lhs=lhs, rhs=jnp.asarray(np.stack(ws)), group_sizes=jnp.full((groups,), m_per_group, jnp.int32),
+        rhs_scale=jnp.asarray(np.stack(ss)), preferred_element_type=jnp.float32,
+        maybe_quantize_lhs=False, rhs_fp4_packed=True,
+    )[:m]
+    lhs32 = np.asarray(lhs, np.float32)
+    want = np.concatenate(
+        [lhs32[g * m_per_group : (g + 1) * m_per_group] @ refs[g] for g in range(groups)]
+    )
+    np.testing.assert_allclose(np.asarray(out, np.float32), want, rtol=1e-5, atol=1e-5 * np.abs(want).max())

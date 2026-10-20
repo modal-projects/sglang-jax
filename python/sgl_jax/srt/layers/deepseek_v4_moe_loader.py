@@ -261,6 +261,38 @@ def mxfp4_pair_to_resident_fp4(packed: np.ndarray, codes: np.ndarray, *, key: st
     return np.ascontiguousarray(weight), scale.astype(ml_dtypes.bfloat16).T[:, None, :]
 
 
+def mxfp4_pair_to_packed_fp4(packed: np.ndarray, codes: np.ndarray, *, key: str):
+    """Checkpoint MXFP4 pair -> GMM packed-FP4 layout, values unchanged.
+
+    Returns weight uint32 [K/8, N] (64-row chunks: packed row r = 8c + j, byte b holds K row
+    64c + 4j + b in the low nibble and 64c + 32 + 4j + b in the high nibble; see
+    gmm_v2.expand_fp4_packed_e5m2) and scale f32 [K/32, 1, N] = 2**(e8m0 - 127 + 14).
+    """
+    from sgl_jax.srt.kernels.gmm.megablox_gmm_kernel.gmm_v2 import (
+        FP4_PACK_CHUNK,
+        FP4_PACKED_SCALE_EXP,
+    )
+
+    packed = np.ascontiguousarray(packed).view(np.uint8)
+    codes = np.ascontiguousarray(codes).view(np.uint8)
+    n, half_k = packed.shape
+    k = 2 * half_k
+    if k % FP4_PACK_CHUNK or codes.shape != (n, k // 32):
+        raise ValueError(f"{key}: weight {packed.shape} / scale {codes.shape} not packable")
+    if np.any(codes == 255):
+        raise ValueError(f"{key}: reserved F8_E8M0 scale code 255")
+    nib = np.empty((n, k), np.uint8)
+    nib[:, 0::2] = packed & np.uint8(0x0F)
+    nib[:, 1::2] = packed >> np.uint8(4)
+    c6 = nib.T.reshape(k // 64, 2, 8, 4, n).astype(np.uint32)  # [chunk, half, j, b, n]
+    words = np.zeros((k // 64, 8, n), np.uint32)
+    for b in range(4):
+        words |= (c6[:, 0, :, b, :] << (8 * b)) | (c6[:, 1, :, b, :] << (8 * b + 4))
+    exp = codes.astype(np.int16) - 127 + FP4_PACKED_SCALE_EXP
+    scale = np.ldexp(np.ones(codes.shape, np.float32), exp).T[:, None, :]
+    return words.reshape(k // 8, n), np.ascontiguousarray(scale)
+
+
 def _put_expert_rows(buffers, physical_id: int, stem: str, values: dict[bool, np.ndarray]):
     """Write one expert's decoded weight and scale into every local shard that owns it."""
     for param, is_scale, _, shards in buffers:
@@ -510,14 +542,19 @@ def load_moe_weights(
             stem = prefix + f"experts.{expert_id}.{source}"
             wk, sk = stem + ".weight", stem + ".scale"
             weight_entry, scale_entry = assigned[wk][0], assigned[sk][0]
-            if weight_param.value.dtype == jnp.int4:
+            if weight_param.value.dtype in (jnp.int4, jnp.uint32):
                 with (
                     open(weight_entry["file"], "rb") as weight_source,
                     open(scale_entry["file"], "rb") as scale_source,
                 ):
                     packed = _read_rows(weight_source, weight_entry, slice(None))
                     codes = _read_rows(scale_source, scale_entry, slice(None))
-                values = mxfp4_pair_to_resident_fp4(packed, codes, key=wk)
+                to_resident = (
+                    mxfp4_pair_to_packed_fp4
+                    if weight_param.value.dtype == jnp.uint32
+                    else mxfp4_pair_to_resident_fp4
+                )
+                values = to_resident(packed, codes, key=wk)
             else:
                 with (
                     open(weight_entry["file"], "rb") as weight_source,

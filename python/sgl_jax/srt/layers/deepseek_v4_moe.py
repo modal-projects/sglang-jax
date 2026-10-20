@@ -36,9 +36,11 @@ _W8A8_DENSE_NAMES = (
 #   "fp4": keep the checkpoint's E2M1 values and per-K32 E8M0 scales as-is; GMM dequantizes
 #          each weight tile to bf16 in VMEM. Halves expert HBM bytes versus "fp8". The E2M1
 #          bit codes are held in int4 arrays: Mosaic cannot unpack float4_e2m1fn on v5e/v6e.
+#   "fp4packed": the same exact E2M1 values packed 8 per uint32 (see gmm_v2.expand_fp4_packed_e5m2),
+#          expanded to E5M2 with SWAR mask/shift in VMEM; K32 scales applied per block on the output.
 EXPERT_STORAGE = os.environ.get("SGLJAX_DSV4_EXPERT_STORAGE", "fp8")
-if EXPERT_STORAGE not in ("fp8", "fp4"):
-    raise ValueError(f"SGLJAX_DSV4_EXPERT_STORAGE must be fp8 or fp4, got {EXPERT_STORAGE!r}")
+if EXPERT_STORAGE not in ("fp8", "fp4", "fp4packed"):
+    raise ValueError(f"SGLJAX_DSV4_EXPERT_STORAGE must be fp8, fp4 or fp4packed, got {EXPERT_STORAGE!r}")
 MXFP4_BLOCK = 32
 
 
@@ -56,7 +58,15 @@ class DeepseekV4EPMoE(EPMoE):
     def _call_gmm(self, **kwargs):
         if self.wi_0.value.dtype == jnp.int4 and EXPERT_STORAGE == "fp4":
             kwargs["rhs_e2m1_codes"] = True
+        if self.wi_0.value.dtype == jnp.uint32 and EXPERT_STORAGE == "fp4packed":
+            kwargs["rhs_fp4_packed"] = True
         return super()._call_gmm(**kwargs)
+
+    def _normalize_scale_for_gmm(self, scale, weight, *, scale_name):
+        if weight.dtype == jnp.uint32:
+            # Packed FP4: weight rows are K/8, but the scales are created in GMM's [E, K/32, 1, N].
+            return scale
+        return super()._normalize_scale_for_gmm(scale, weight, scale_name=scale_name)
 
     def _apply_activation(self, layer_w0, layer_w1):
         if self.swiglu_limit is None:
@@ -226,8 +236,9 @@ class DeepseekV4MoE(nnx.Module):
         if getattr(config, "expert_dtype", None) == "fp4":
             if self.experts.replicate_experts:
                 raise ValueError("V4 resident FP8 experts require moe_dp_size=1")
-            fp4 = EXPERT_STORAGE == "fp4"
-            weight_dtype = jnp.int4 if fp4 else jnp.float8_e4m3fn
+            packed = EXPERT_STORAGE == "fp4packed"
+            fp4 = EXPERT_STORAGE == "fp4" or packed
+            weight_dtype = jnp.uint32 if packed else jnp.int4 if fp4 else jnp.float8_e4m3fn
             self.experts.quantized_dtype = weight_dtype
             # FP4 keeps per-K32 block scales, which GMM reads as [E, K/32, 1, N].
             self.experts.weight_block_size = (MXFP4_BLOCK, MXFP4_BLOCK) if fp4 else None
@@ -238,10 +249,11 @@ class DeepseekV4MoE(nnx.Module):
                     if fp4 and self.experts.tp_size != 1:
                         raise ValueError("FP4 expert storage requires ep_size == world size")
                     k_blocks = old.shape[1] // MXFP4_BLOCK if fp4 else 1
+                    shape = (old.shape[0], old.shape[1] // 8, old.shape[2]) if packed else old.shape
                     setattr(
                         self.experts,
                         name,
-                        nnx.Param(jnp.zeros(old.shape, weight_dtype, out_sharding=spec)),
+                        nnx.Param(jnp.zeros(shape, weight_dtype, out_sharding=spec)),
                     )
                     setattr(
                         self.experts,
@@ -250,7 +262,7 @@ class DeepseekV4MoE(nnx.Module):
                             nnx.Param(
                                 jnp.ones(
                                     (old.shape[0], k_blocks, 1, old.shape[2]),
-                                    jnp.bfloat16 if fp4 else jnp.float32,
+                                    jnp.bfloat16 if fp4 and not packed else jnp.float32,
                                     out_sharding=P(spec[0], None, None, spec[2]),
                                 )
                             )

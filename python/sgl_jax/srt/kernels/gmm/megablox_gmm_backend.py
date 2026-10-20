@@ -29,6 +29,7 @@ def gmm(
     activation_quantized_dtype: jnp.dtype | None = None,
     v2_tile_info: Any = None,
     rhs_e2m1_codes: bool = False,
+    rhs_fp4_packed: bool = False,
 ) -> jax.Array:
     """Dispatch GMM to v2 or v1, with optional activation quantization.
 
@@ -65,7 +66,7 @@ def gmm(
     use_gmm_v2 = not interpret and is_supported_by_gmm_v2(
         rhs_scale, maybe_quantize_lhs=maybe_quantize_lhs
     )
-    if rhs_e2m1_codes and not use_gmm_v2:
+    if (rhs_e2m1_codes or rhs_fp4_packed) and not use_gmm_v2:
         raise NotImplementedError("E2M1-coded (MXFP4) weights require the GMM v2 TPU kernel")
 
     # Pad LHS to multiple of 128 (or 32 for v2) on TPU to avoid small/unaligned tiles
@@ -88,6 +89,8 @@ def gmm(
             v2_kwargs["tile_info"] = v2_tile_info
         if rhs_e2m1_codes:
             v2_kwargs["rhs_e2m1_codes"] = True
+        if rhs_fp4_packed:
+            v2_kwargs["rhs_fp4_packed"] = True
         out = gmm_v2_kernel(
             lhs,
             rhs,
