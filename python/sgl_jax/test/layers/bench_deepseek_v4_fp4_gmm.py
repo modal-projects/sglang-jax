@@ -49,7 +49,8 @@ def timeit(f, *a, iters=50, reps=7):
 
 
 print(jax.devices()[0].device_kind)
-W = {fmt: {"wi": weights(H, I, fmt), "wo": weights(I, H, fmt)} for fmt in ("bf16", "fp8", "fp4")}
+# distinct w1/w3 (as in the model): identical operands would let XLA CSE one GEMM away
+W = {fmt: {"w1": weights(H, I, fmt), "w3": weights(H, I, fmt), "wo": weights(I, H, fmt)} for fmt in ("bf16", "fp8", "fp4")}
 for batch in (1, 8, 32, 64, 128, 256):
     m = max(E, batch * 6 // 16)
     m -= m % E
@@ -61,16 +62,16 @@ for batch in (1, 8, 32, 64, 128, 256):
         kw = dict(group_sizes=gs, preferred_element_type=jnp.bfloat16, maybe_quantize_lhs=False)
         if fmt == "fp4":
             kw["rhs_e2m1_codes"] = True
-        (wi, wis), (wo, wos) = W[fmt]["wi"], W[fmt]["wo"]
+        (w1, w1s), (w3, w3s), (wo, wos) = W[fmt]["w1"], W[fmt]["w3"], W[fmt]["wo"]
         # one expert FFN: two up GEMMs (w1, w3) + one down GEMM
         f = jax.jit(
-            lambda x, h, wi, wis, wo, wos, kw=kw: (
-                gmm(lhs=x, rhs=wi, rhs_scale=wis, **kw),
-                gmm(lhs=x, rhs=wi, rhs_scale=wis, **kw),
+            lambda x, h, w1, w1s, w3, w3s, wo, wos, kw=kw: (
+                gmm(lhs=x, rhs=w1, rhs_scale=w1s, **kw),
+                gmm(lhs=x, rhs=w3, rhs_scale=w3s, **kw),
                 gmm(lhs=h, rhs=wo, rhs_scale=wos, **kw),
             )
         )
-        t, sp = timeit(f, x, h, wi, wis, wo, wos)
+        t, sp = timeit(f, x, h, w1, w1s, w3, w3s, wo, wos)
         wbytes = 3 * E * H * I * {"bf16": 2, "fp8": 1, "fp4": 0.5}[fmt]
         row.append(f"{fmt} {t*1e6:7.1f}us ({wbytes/t/1e9:5.0f} GB/s wt, sp {100*sp:.0f}%)")
     print("  ".join(row), flush=True)
