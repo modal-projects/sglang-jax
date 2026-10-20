@@ -74,6 +74,7 @@ class InputConfigs:
 
 FP4_PACK_CHUNK = 64  # K rows per packing chunk: 8 packed uint32 rows -> 32 low + 32 high nibble rows
 FP4_PACKED_SCALE_EXP = 14  # expansion yields value * 2**-14; the caller's K32 scales carry 2**14
+FP4_PACKED_MAX_TILE_M = 32
 
 
 def expand_fp4_packed_e5m2(words: jax.Array) -> jax.Array:
@@ -1018,6 +1019,10 @@ def make_gmm_configs(
         lhs_q_dtype = lhs_q_dtype if lhs_q_dtype is not None else lhs.dtype
         rhs_tile_dtype = jnp.int4 if rhs_fp4_packed else rhs.dtype
         tiles = tile_info(lhs_q_dtype, rhs_tile_dtype, dims, vmem_limit_bytes)
+        if rhs_fp4_packed and tiles.tile_m > FP4_PACKED_MAX_TILE_M:
+            # The K32 block-dot loop's cost grows with rows per tile: on v5e/v6e tile_m > 32 is
+            # 1.7-2x slower at 48-96 rows/device (fp4p_tile_sweep), while <= 32 rows is unaffected.
+            tiles = dataclasses.replace(tiles, tile_m=FP4_PACKED_MAX_TILE_M)
     if rhs_fp4_packed:
         assert tiles.tile_k % FP4_PACK_CHUNK == 0 and dims.size_k % tiles.tile_k == 0, tiles
 
