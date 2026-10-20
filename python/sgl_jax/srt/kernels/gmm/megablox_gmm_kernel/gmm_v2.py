@@ -1139,8 +1139,9 @@ def gmm_v2(
     # Prepare block specs.
     rhs_scale_spec = rhs_bias_spec = None
     if rhs_scale is not None:
-        if not rhs_e2m1_codes:
-            # E2M1 scales stay bf16 (exact powers of two): an f32 copy is 2x the scale traffic.
+        if not (rhs_e2m1_codes or rhs_fp4_packed):
+            # FP4 scales are powers of two: keep a bf16 copy as given (an f32 copy doubles the
+            # scale traffic); other paths compute in f32.
             rhs_scale = rhs_scale.astype(jnp.float32)
         if rhs_scale.shape[1] > 1:
             block_size = cfgs.rhs_cfgs.quant_block_size

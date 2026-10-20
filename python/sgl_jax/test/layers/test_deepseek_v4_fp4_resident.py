@@ -133,7 +133,7 @@ def test_packed_fp4_is_exact_and_in_gmm_layout():
 
 
 @pytest.mark.skipif(os.environ.get("JAX_PLATFORMS", "") == "cpu", reason="GMM v2 needs a TPU")
-@pytest.mark.parametrize("scale_layout", ["rows", "4d"])
+@pytest.mark.parametrize("scale_layout", ["rows", "4d", "rows-bf16"])
 @pytest.mark.parametrize("m_per_group", [1, 7, 64, 300])
 def test_gmm_v2_fp4_packed_matches_dequantized_reference(m_per_group, scale_layout):
     import jax
@@ -157,7 +157,13 @@ def test_gmm_v2_fp4_packed_matches_dequantized_reference(m_per_group, scale_layo
     lhs = jnp.asarray(rng.standard_normal((m, k)).astype(np.float32) * 0.05, jnp.bfloat16)
     out = gmm(
         lhs=lhs, rhs=jnp.asarray(np.stack(ws)), group_sizes=jnp.full((groups,), m_per_group, jnp.int32),
-        rhs_scale=jnp.asarray(np.stack(ss) if scale_layout == "rows" else np.stack(ss)[:, :, None, :]),
+        rhs_scale=(
+            jnp.asarray(np.stack(ss))
+            if scale_layout == "rows"
+            else jnp.asarray(np.stack(ss), jnp.bfloat16)  # powers of two: exact in bf16
+            if scale_layout == "rows-bf16"
+            else jnp.asarray(np.stack(ss)[:, :, None, :])
+        ),
         preferred_element_type=jnp.float32, maybe_quantize_lhs=False, rhs_fp4_packed=True,
     )[:m]
     lhs32 = np.asarray(lhs, np.float32)
