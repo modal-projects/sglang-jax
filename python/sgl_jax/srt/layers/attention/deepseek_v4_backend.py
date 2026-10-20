@@ -209,6 +209,9 @@ class DeepseekV4AttentionBackend(AttentionBackend, DeepseekV4HCABackendMixin):
         self.mesh = mesh
         self.page_size = page_size
         self.max_context_len = max_context_len
+        from sgl_jax.srt.layers.attention.dsv4.indexer import set_max_tokens_per_seq
+
+        set_max_tokens_per_seq(max_context_len)
         self.request_capacity = 1
         self.window_size = int(getattr(config, "sliding_window", 128))
         # H's shared execution adapter takes this model dimension explicitly.

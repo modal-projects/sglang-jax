@@ -79,6 +79,18 @@ def resolve_indexer_backend(backend: str = "auto") -> str:
     return backend
 
 
+# Per-request bound on completed entries (``max_context_len // ratio``), registered by the V4
+# attention backend. Without it every request's page-table row spans the whole batch's gathered
+# history, so the kernel's SMEM-prefetched table grows as requests x total history and overflows
+# 1 MiB SMEM at 256 requests even for short contexts.
+_MAX_TOKENS_PER_SEQ: int | None = None
+
+
+def set_max_tokens_per_seq(tokens: int | None) -> None:
+    global _MAX_TOKENS_PER_SEQ
+    _MAX_TOKENS_PER_SEQ = tokens
+
+
 def kernel_read_layout(compressed_rows, seq_lens, q_lens, *, ratio: int, compressed_page_size: int):
     """Per-request page table and gathered-row offsets from the flat read tables.
 
@@ -96,7 +108,8 @@ def kernel_read_layout(compressed_rows, seq_lens, q_lens, *, ratio: int, compres
     counts = jnp.where(jnp.asarray(q_lens) > 0, seq_lens // ratio, 0).astype(jnp.int32)
     offsets = jnp.cumsum(counts) - counts
     capacity = compressed_rows.shape[0]
-    pages_per_seq = max(1, -(-capacity // compressed_page_size))
+    per_seq = capacity if _MAX_TOKENS_PER_SEQ is None else min(capacity, _MAX_TOKENS_PER_SEQ // ratio)
+    pages_per_seq = max(1, -(-per_seq // compressed_page_size))
     first = (
         offsets[:, None]
         + jnp.arange(pages_per_seq, dtype=jnp.int32)[None, :] * compressed_page_size
