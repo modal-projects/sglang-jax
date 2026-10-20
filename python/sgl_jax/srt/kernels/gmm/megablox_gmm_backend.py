@@ -63,8 +63,9 @@ def gmm(
     if interpret is None:
         interpret = not is_tpu_runtime()
 
-    use_gmm_v2 = not interpret and is_supported_by_gmm_v2(
-        rhs_scale, maybe_quantize_lhs=maybe_quantize_lhs
+    use_gmm_v2 = not interpret and (
+        # packed FP4 is v2-only and may carry row-layout [G, K/32, N] scales
+        rhs_fp4_packed or is_supported_by_gmm_v2(rhs_scale, maybe_quantize_lhs=maybe_quantize_lhs)
     )
     if (rhs_e2m1_codes or rhs_fp4_packed) and not use_gmm_v2:
         raise NotImplementedError("E2M1-coded (MXFP4) weights require the GMM v2 TPU kernel")
