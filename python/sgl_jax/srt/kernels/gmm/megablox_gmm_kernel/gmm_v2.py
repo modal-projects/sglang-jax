@@ -68,6 +68,8 @@ class InputConfigs:
     e2m1_codes: bool = False
     # rhs is packed MXFP4 (uint32 [G, K/8, N], see expand_fp4_packed_e5m2), expanded to E5M2 in VMEM.
     fp4_packed: bool = False
+    # packed-FP4 scales given as [G, K/32, N] (row per K32 block) instead of [G, K/32, 1, N]
+    scale_2d: bool = False
 
 
 FP4_PACK_CHUNK = 64  # K rows per packing chunk: 8 packed uint32 rows -> 32 low + 32 high nibble rows
@@ -169,6 +171,10 @@ class IndexMaps:
         group_id = self.metadata_ref.gm_id_to_group_id[gm_id]
         return (group_id, k_id, 0, n_id)
 
+    def rhs_scale_rows_index_map(self, n_id: jax.Array, gm_id: jax.Array, k_id: jax.Array):
+        group_id = self.metadata_ref.gm_id_to_group_id[gm_id]
+        return (group_id, k_id, n_id)
+
     def out_index_map(self, n_id: jax.Array, gm_id: jax.Array, _: jax.Array):
         is_last_gm = gm_id == (pl.num_programs(1) - 1)
         m_start = self.metadata_ref.gm_id_to_m_offset[gm_id]
@@ -214,10 +220,16 @@ def generate_block_specs(
                 cfgs.tiles.tile_k % rhs_block == 0
             ), f"block-scale: tile_k={cfgs.tiles.tile_k} must divide rhs_block={rhs_block}"
             num_scale_per_tile = cfgs.tiles.tile_k // rhs_block
-            rhs_scale_block_spec = pl.BlockSpec(
-                (None, num_scale_per_tile, 1, cfgs.tiles.tile_n),
-                index_map.rhs_scale_block_index_map,
-            )
+            if cfgs.rhs_cfgs.scale_2d:
+                rhs_scale_block_spec = pl.BlockSpec(
+                    (None, num_scale_per_tile, cfgs.tiles.tile_n),
+                    index_map.rhs_scale_rows_index_map,
+                )
+            else:
+                rhs_scale_block_spec = pl.BlockSpec(
+                    (None, num_scale_per_tile, 1, cfgs.tiles.tile_n),
+                    index_map.rhs_scale_block_index_map,
+                )
         else:
             rhs_scale_block_spec = pl.BlockSpec(
                 (None, None, 1, cfgs.tiles.tile_n),
@@ -304,7 +316,10 @@ def inner_kernel(
                         w[lo_k : lo_k + rhs_block],
                         preferred_element_type=jnp.float32,
                     )
-                    acc += part * tiled_rhs_ref.scale[blk_i, 0:1, :]
+                    if cfgs.rhs_cfgs.scale_2d:
+                        acc += part * tiled_rhs_ref.scale[blk_i : blk_i + 1, :]
+                    else:
+                        acc += part * tiled_rhs_ref.scale[blk_i, 0:1, :]
             elif cfgs.rhs_cfgs.e2m1_codes:
                 # W4A16 MXFP4: per-block matmuls would be K=32 wide, so dequantize the whole
                 # tile in VMEM (E2M1 decode x per-K32 scale) and run one full-K matmul.
@@ -850,12 +865,15 @@ def validate_inputs(
         assert rhs_bias.shape == (size_group, 1, size_n)
     if rhs_scale is not None:
         num_k_blocks = rhs_scale.shape[1]
-        assert rhs_scale.shape == (
-            size_group,
-            num_k_blocks,
-            1,
-            size_n,
-        ), f"rhs_scale shape {rhs_scale.shape} != ({size_group}, {num_k_blocks}, 1, {size_n})"
+        if rhs_fp4_packed and rhs_scale.ndim == 3:
+            assert rhs_scale.shape == (size_group, num_k_blocks, size_n), rhs_scale.shape
+        else:
+            assert rhs_scale.shape == (
+                size_group,
+                num_k_blocks,
+                1,
+                size_n,
+            ), f"rhs_scale shape {rhs_scale.shape} != ({size_group}, {num_k_blocks}, 1, {size_n})"
         if num_k_blocks > 1:
             assert (
                 size_k % num_k_blocks == 0
@@ -954,6 +972,7 @@ def make_gmm_configs(
         has_scale=has_scale,
         e2m1_codes=rhs_e2m1_codes,
         fp4_packed=rhs_fp4_packed,
+        scale_2d=rhs_fp4_packed and rhs_scale is not None and rhs_scale.ndim == 3,
     )
 
     lhs_q_dtype = None
@@ -1124,7 +1143,8 @@ def gmm_v2(
             target_k_blocks = num_k_tiles * (tiles.tile_k // block_size)
             if target_k_blocks > rhs_scale.shape[1]:
                 pad_k = target_k_blocks - rhs_scale.shape[1]
-                rhs_scale = jnp.pad(rhs_scale, ((0, 0), (0, pad_k), (0, 0), (0, 0)))
+                pad = ((0, 0), (0, pad_k)) + ((0, 0),) * (rhs_scale.ndim - 2)
+                rhs_scale = jnp.pad(rhs_scale, pad)
         rhs_scale_spec = pl.BlockSpec(memory_space=pltpu.HBM)
     if rhs_bias is not None:
         rhs_bias = rhs_bias.astype(jnp.float32)

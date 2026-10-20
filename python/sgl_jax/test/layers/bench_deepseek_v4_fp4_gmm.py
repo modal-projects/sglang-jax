@@ -26,14 +26,17 @@ def weights(k, n, fmt):
         w = jnp.asarray(rng.standard_normal((E, k, n)).astype(np.float32), jnp.float8_e4m3fn)
         return w, jnp.full((E, 1, 1, n), 0.01, jnp.float32)
     ws, ss = [], []
-    to_resident = mxfp4_pair_to_packed_fp4 if fmt == "fp4p" else mxfp4_pair_to_resident_fp4
+    to_resident = mxfp4_pair_to_packed_fp4 if fmt in ("fp4p", "fp4p4d") else mxfp4_pair_to_resident_fp4
     for _ in range(E):
         packed = rng.integers(0, 256, size=(n, k // 2), dtype=np.uint8)
         codes = rng.integers(120, 130, size=(n, k // 32), dtype=np.uint8)
         w, s = to_resident(packed, codes, key="b")
         ws.append(w)
         ss.append(s)
-    return jnp.asarray(np.stack(ws)), jnp.asarray(np.stack(ss))
+    s = np.stack(ss)
+    if fmt == "fp4p4d":  # packed FP4 with the old [E, K/32, 1, N] scale layout (A/B)
+        s = s[:, :, None, :]
+    return jnp.asarray(np.stack(ws)), jnp.asarray(s)
 
 
 def timeit(f, *a, iters=50, reps=7):
@@ -51,7 +54,7 @@ def timeit(f, *a, iters=50, reps=7):
 
 print(jax.devices()[0].device_kind)
 # distinct w1/w3 (as in the model): identical operands would let XLA CSE one GEMM away
-W = {fmt: {"w1": weights(H, I, fmt), "w3": weights(H, I, fmt), "wo": weights(I, H, fmt)} for fmt in ("bf16", "fp8", "fp4", "fp4p")}
+W = {fmt: {"w1": weights(H, I, fmt), "w3": weights(H, I, fmt), "wo": weights(I, H, fmt)} for fmt in ("bf16", "fp8", "fp4", "fp4p", "fp4p4d")}
 for batch in (1, 8, 32, 64, 128, 256):
     m = max(E, batch * 6 // 16)
     m -= m % E
@@ -59,11 +62,11 @@ for batch in (1, 8, 32, 64, 128, 256):
     x = jnp.asarray(rng.standard_normal((m, H)).astype(np.float32), jnp.bfloat16)
     h = jnp.asarray(rng.standard_normal((m, I)).astype(np.float32), jnp.bfloat16)
     row = [f"batch {batch:4d} (m/dev={m:4d}):"]
-    for fmt in ("bf16", "fp8", "fp4", "fp4p"):
+    for fmt in ("bf16", "fp8", "fp4", "fp4p", "fp4p4d"):
         kw = dict(group_sizes=gs, preferred_element_type=jnp.bfloat16, maybe_quantize_lhs=False)
         if fmt == "fp4":
             kw["rhs_e2m1_codes"] = True
-        if fmt == "fp4p":
+        if fmt in ("fp4p", "fp4p4d"):
             kw["rhs_fp4_packed"] = True
         (w1, w1s), (w3, w3s), (wo, wos) = W[fmt]["w1"], W[fmt]["w3"], W[fmt]["wo"]
         # one expert FFN: two up GEMMs (w1, w3) + one down GEMM
@@ -75,6 +78,6 @@ for batch in (1, 8, 32, 64, 128, 256):
             )
         )
         t, sp = timeit(f, x, h, w1, w1s, w3, w3s, wo, wos)
-        wbytes = 3 * E * H * I * {"bf16": 2, "fp8": 1, "fp4": 0.5, "fp4p": 0.5}[fmt]
+        wbytes = 3 * E * H * I * {"bf16": 2, "fp8": 1, "fp4": 0.5, "fp4p": 0.5, "fp4p4d": 0.5}[fmt]
         row.append(f"{fmt} {t*1e6:7.1f}us ({wbytes/t/1e9:5.0f} GB/s wt, sp {100*sp:.0f}%)")
     print("  ".join(row), flush=True)

@@ -266,7 +266,7 @@ def mxfp4_pair_to_packed_fp4(packed: np.ndarray, codes: np.ndarray, *, key: str)
 
     Returns weight uint32 [K/8, N] (64-row chunks: packed row r = 8c + j, byte b holds K row
     64c + 4j + b in the low nibble and 64c + 32 + 4j + b in the high nibble; see
-    gmm_v2.expand_fp4_packed_e5m2) and scale f32 [K/32, 1, N] = 2**(e8m0 - 127 + 14).
+    gmm_v2.expand_fp4_packed_e5m2) and scale f32 [K/32, N] = 2**(e8m0 - 127 + 14) (one row per K32 block).
     """
     from sgl_jax.srt.kernels.gmm.megablox_gmm_kernel.gmm_v2 import (
         FP4_PACK_CHUNK,
@@ -289,7 +289,7 @@ def mxfp4_pair_to_packed_fp4(packed: np.ndarray, codes: np.ndarray, *, key: str)
     for b in range(4):
         words |= (c6[:, 0, :, b, :] << (8 * b)) | (c6[:, 1, :, b, :] << (8 * b + 4))
     exp = codes.astype(np.int16) - 127 + FP4_PACKED_SCALE_EXP
-    scale = np.ldexp(np.ones(codes.shape, np.float32), exp).T[:, None, :]
+    scale = np.ldexp(np.ones(codes.shape, np.float32), exp).T
     return words.reshape(k // 8, n), np.ascontiguousarray(scale)
 
 

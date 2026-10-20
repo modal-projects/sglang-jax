@@ -126,15 +126,16 @@ def test_packed_fp4_is_exact_and_in_gmm_layout():
     packed, codes = _random_pair(rng, n, k)
     words, scale = mxfp4_pair_to_packed_fp4(packed, codes, key="t")
     assert words.dtype == np.uint32 and words.shape == (k // 8, n)
-    assert scale.dtype == np.float32 and scale.shape == (k // 32, 1, n)
+    assert scale.dtype == np.float32 and scale.shape == (k // 32, n)
     vals = _emulate_packed_expand(words)
-    got = vals * np.repeat(scale[:, 0, :], 32, axis=0) * np.float32(2.0**-FP4_PACKED_SCALE_EXP)
+    got = vals * np.repeat(scale, 32, axis=0) * np.float32(2.0**-FP4_PACKED_SCALE_EXP)
     np.testing.assert_array_equal(got, _reference_dequant(packed, codes).T)
 
 
 @pytest.mark.skipif(os.environ.get("JAX_PLATFORMS", "") == "cpu", reason="GMM v2 needs a TPU")
+@pytest.mark.parametrize("scale_layout", ["rows", "4d"])
 @pytest.mark.parametrize("m_per_group", [1, 7, 64, 300])
-def test_gmm_v2_fp4_packed_matches_dequantized_reference(m_per_group):
+def test_gmm_v2_fp4_packed_matches_dequantized_reference(m_per_group, scale_layout):
     import jax
     import jax.numpy as jnp
 
@@ -156,8 +157,8 @@ def test_gmm_v2_fp4_packed_matches_dequantized_reference(m_per_group):
     lhs = jnp.asarray(rng.standard_normal((m, k)).astype(np.float32) * 0.05, jnp.bfloat16)
     out = gmm(
         lhs=lhs, rhs=jnp.asarray(np.stack(ws)), group_sizes=jnp.full((groups,), m_per_group, jnp.int32),
-        rhs_scale=jnp.asarray(np.stack(ss)), preferred_element_type=jnp.float32,
-        maybe_quantize_lhs=False, rhs_fp4_packed=True,
+        rhs_scale=jnp.asarray(np.stack(ss) if scale_layout == "rows" else np.stack(ss)[:, :, None, :]),
+        preferred_element_type=jnp.float32, maybe_quantize_lhs=False, rhs_fp4_packed=True,
     )[:m]
     lhs32 = np.asarray(lhs, np.float32)
     want = np.concatenate(

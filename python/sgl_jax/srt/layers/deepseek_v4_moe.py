@@ -64,7 +64,7 @@ class DeepseekV4EPMoE(EPMoE):
 
     def _normalize_scale_for_gmm(self, scale, weight, *, scale_name):
         if weight.dtype == jnp.uint32:
-            # Packed FP4: weight rows are K/8, but the scales are created in GMM's [E, K/32, 1, N].
+            # Packed FP4: weight rows are K/8; scales are created as GMM v2 scale_2d rows [E, K/32, N].
             return scale
         return super()._normalize_scale_for_gmm(scale, weight, scale_name=scale_name)
 
@@ -255,15 +255,24 @@ class DeepseekV4MoE(nnx.Module):
                         name,
                         nnx.Param(jnp.zeros(shape, weight_dtype, out_sharding=spec)),
                     )
+                    # Packed FP4 keeps its K32 scales as rows [E, K/32, N] (GMM v2 scale_2d).
+                    scale_shape = (
+                        (old.shape[0], k_blocks, old.shape[2])
+                        if packed
+                        else (old.shape[0], k_blocks, 1, old.shape[2])
+                    )
+                    scale_spec = (
+                        P(spec[0], None, spec[2]) if packed else P(spec[0], None, None, spec[2])
+                    )
                     setattr(
                         self.experts,
                         name + "_scale",
                         nnx.data(
                             nnx.Param(
                                 jnp.ones(
-                                    (old.shape[0], k_blocks, 1, old.shape[2]),
+                                    scale_shape,
                                     jnp.bfloat16 if fp4 and not packed else jnp.float32,
-                                    out_sharding=P(spec[0], None, None, spec[2]),
+                                    out_sharding=scale_spec,
                                 )
                             )
                         ),
