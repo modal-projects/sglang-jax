@@ -75,10 +75,12 @@ class InputConfigs:
 FP4_PACK_CHUNK = 64  # K rows per packing chunk: 8 packed uint32 rows -> 32 low + 32 high nibble rows
 FP4_PACKED_SCALE_EXP = 14  # expansion yields value * 2**-14; the caller's K32 scales carry 2**14
 FP4_PACKED_MAX_TILE_M = 32
-# Prefill: with at least this many rows, expand each weight tile once, apply the K32 scales to the
-# weights in bf16 (exact: power-of-two scale x E2M1 value) and run one full-K matmul per tile with
-# a large tile_m. The decode path (K32 block dots, tile_m <= 32) caps out near ~47 TF on v5e.
-FP4_PACKED_FULL_K_MIN_M = 512
+# Prefill: with at least this many rows per expert, expand each weight tile once, apply the K32
+# scales to the weights in bf16 (exact: power-of-two scale x E2M1 value) and run one full-K matmul
+# per tile with a large tile_m. The decode path (K32 block dots, tile_m <= 32) caps out near ~47 TF
+# on v5e; the full-K path pays a fixed ~2x expansion cost, so it wins from ~96 rows/expert
+# (v5e, 16 experts: 1024 rows 1123 vs 1263 us, 2048 rows 2196 vs 1264 us, 8192 rows 8679 vs 2479 us).
+FP4_PACKED_FULL_K_MIN_ROWS_PER_GROUP = 96
 FP4_PACKED_FULL_K_TILE_M = 256
 FP4_PACKED_FULL_K_MAX_TILE_N = 512
 
@@ -1036,7 +1038,7 @@ def make_gmm_configs(
         lhs_q_dtype = lhs_q_dtype if lhs_q_dtype is not None else lhs.dtype
         rhs_tile_dtype = jnp.int4 if rhs_fp4_packed else rhs.dtype
         tiles = tile_info(lhs_q_dtype, rhs_tile_dtype, dims, vmem_limit_bytes)
-        if rhs_fp4_packed and dims.size_m >= FP4_PACKED_FULL_K_MIN_M:
+        if rhs_fp4_packed and dims.size_m >= FP4_PACKED_FULL_K_MIN_ROWS_PER_GROUP * dims.size_group:
             # Prefill: full-K scaled-weight path (tile_m > FP4_PACKED_MAX_TILE_M selects it).
             tiles = dataclasses.replace(
                 tiles,
