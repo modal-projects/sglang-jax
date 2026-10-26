@@ -333,6 +333,17 @@ def inner_kernel(
                         # int8 MXU): int4 values are exact in e4m3, so upcast the
                         # weight tile in-kernel. See select_lhs_quant_dtype.
                         block_rhs = block_rhs.astype(lhs_q_dtype)
+                    elif (
+                        not jnp.issubdtype(lhs_q_dtype, jnp.floating)
+                        and not jnp.issubdtype(block_rhs.dtype, jnp.floating)
+                        and block_rhs.dtype != lhs_q_dtype
+                    ):
+                        # Narrower integer weights on the int8 MXU (W4A8 on chips
+                        # with an int8 MXU, e.g. v6e): Mosaic has no mixed
+                        # int8 x int4 tpu.matmul ("Mix int/int - NYI"), so unpack
+                        # the int4 tile to int8 in VMEM (exact) and run an
+                        # int8 x int8 dot with int32 accumulation.
+                        block_rhs = block_rhs.astype(lhs_q_dtype)
                     block_acc = jnp.matmul(
                         block_lhs_q,
                         block_rhs,
@@ -911,12 +922,14 @@ def select_lhs_quant_dtype(rhs_quant_dtype: jnp.dtype, tpu_info: pltpu.TpuInfo) 
 
       * float rhs (fp8): e4m3 on chips with an fp8 MXU.
       * int8 rhs: int8 on chips with an int8 MXU.
-      * int4 rhs: int8 on chips with an int8 MXU; otherwise e4m3 on chips with
-        an fp8 MXU (W4A8). Every int4 value is exactly representable in e4m3,
-        so the kernel upcasts the weight tile and the result matches an int8
-        MXU bit-for-bit up to the activation rounding, which is the same e4m3
-        rounding the fp8 checkpoints already use. ``SGLANG_JAX_GMM_INT4_A8=0``
-        disables this fallback and keeps bf16 activations (W4A16).
+      * int4 rhs: int8 on chips with an int8 MXU (the kernel unpacks the int4
+        weight tile to int8 in VMEM, since Mosaic has no int8 x int4 matmul);
+        otherwise e4m3 on chips with an fp8 MXU (W4A8). Every int4 value is
+        exactly representable in e4m3, so the kernel upcasts the weight tile
+        and the result matches an int8 MXU bit-for-bit up to the activation
+        rounding, which is the same e4m3 rounding the fp8 checkpoints already
+        use. ``SGLANG_JAX_GMM_INT4_A8=0`` disables this fallback and keeps
+        bf16 activations (W4A16).
     """
     rhs_quant_dtype = jnp.dtype(rhs_quant_dtype)
     if jnp.issubdtype(rhs_quant_dtype, jnp.floating):
