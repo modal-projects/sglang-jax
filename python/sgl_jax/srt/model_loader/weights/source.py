@@ -40,6 +40,9 @@ _SAFETENSORS_DTYPE_TO_JAX: dict[str, jnp.dtype] = {
     "I32": jnp.int32,
     "I8": jnp.int8,
     "BOOL": jnp.bool_,
+    # Packed sub-byte payloads and their byte scales (MXFP4: E2M1 pairs + E8M0 exponents).
+    "U8": jnp.uint8,
+    "F8_E8M0": jnp.uint8,
     "F8_E4M3": jnp.float8_e4m3fn,
     "F8_E5M2": jnp.float8_e5m2,
 }

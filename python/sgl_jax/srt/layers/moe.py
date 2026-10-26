@@ -188,6 +188,12 @@ class EPMoE(nnx.Module):
         self.activation_quantized_dtype = (
             quantization_config.get_moe_activation_dtype() if quantization_config else None
         )
+        # "mxfp4": static OCP MXFP4 experts kept packed (uint32 [E, K/8, N] + [E, K/32, N] scales)
+        # and run through the gmm_v2 packed-FP4 path with bf16 activations (W4A16, exact).
+        self.weight_format = getattr(quantization_config, "moe_weight_format", None)
+        self.fp4_packed = self.weight_format == "mxfp4"
+        if self.fp4_packed:
+            self.activation_quantized_dtype = None
         if quantization_config is None:
             self.weight_block_size = None
         elif hasattr(quantization_config, "get_moe_weight_block_size"):
@@ -300,6 +306,9 @@ class EPMoE(nnx.Module):
         moe_mesh tensor == 1 (the output dim is not sharded) and static weights."""
         if self.fused_gate_up or self.wi_1 is None:
             return False
+        if self.fp4_packed:
+            # packed-FP4 experts keep the two-call path (no fused-GLU packed-FP4 kernel)
+            return False
         moe_tp = int(self.moe_mesh.shape.get("tensor", 1))
         if moe_tp != 1:
             return False
@@ -368,6 +377,19 @@ class EPMoE(nnx.Module):
                 is_block = False
         return P("expert", "tensor" if is_block else None, None, None)
 
+    def _fp4_scale_spec(self, scale_name: str) -> P:
+        """Packed-FP4 [E, K/32, N] scales shard like their weights: wi on N, wo on K."""
+        if scale_name == "wo_scale":
+            return P("expert", "tensor", None)
+        return P("expert", None, "tensor")
+
+    def _scale_in_spec(self, scale, scale_name: str) -> P:
+        if self.fp4_packed:
+            return self._fp4_scale_spec(scale_name)
+        if scale_name == "wo_scale":
+            return self._get_wo_scale_sharding(scale)
+        return P("expert", None, None, "tensor")
+
     def _normalize_scale_for_gmm(
         self,
         scale: jax.Array | None,
@@ -390,6 +412,16 @@ class EPMoE(nnx.Module):
         """
         if scale is None:
             return None
+
+        if self.fp4_packed:
+            # Packed FP4: weight uint32 [E, K/8, N], row-layout K32 scales [E, K/32, N].
+            num_experts, k8, out_dim = weight.shape
+            if scale.shape != (num_experts, k8 // 4, out_dim):
+                raise ValueError(
+                    f"Unsupported {scale_name} shape {scale.shape} for packed-FP4 weight "
+                    f"{weight.shape}: expected [E, K/32, N] = {(num_experts, k8 // 4, out_dim)}"
+                )
+            return jax.sharding.reshard(scale, self._fp4_scale_spec(scale_name))
 
         # Weight layout is [E, k, n] where k=contraction dim, n=output dim.
         num_experts, in_dim, out_dim = weight.shape
@@ -508,6 +540,15 @@ class EPMoE(nnx.Module):
             if abstract
             else jax.set_mesh(self.moe_mesh)
         )
+        if self.fp4_packed:
+            if not is_static:
+                raise NotImplementedError(
+                    "moe weight_format mxfp4 loads static MXFP4 checkpoints only (no online "
+                    "MXFP4 quantization)"
+                )
+            with mesh_context:
+                self._make_fp4_packed_placeholders()
+            return
         with mesh_context:
             if is_static:
                 if abstract or isinstance(self.wi_0.value, jax.ShapeDtypeStruct):
@@ -654,6 +695,43 @@ class EPMoE(nnx.Module):
                 out_sharding=self._get_wo_scale_sharding(wo_scale),
             )
 
+    def _make_fp4_packed_placeholders(self):
+        """Static packed-FP4 parameter placeholders, filled by the MXFP4 expert loader.
+
+        wi_0/wi_1: uint32 [E, H/8, I] + scale [E, H/32, I]; wo: uint32 [E, I/8, H] + [E, I/32, H].
+        The scales are ``2**(e8m0 - 127 + 14)`` (see utils/quantization/mxfp4.py), stored bf16 by
+        default (powers of two: exact, half the f32 traffic); SGLJAX_MXFP4_SCALE_DTYPE=float32
+        keeps f32.
+        """
+        from sgl_jax.srt.utils.quantization.mxfp4 import FP4_PACK_CHUNK, mxfp4_scale_dtype
+
+        e, h, i = self.wi_0.value.shape[0], self.hidden_size, self.intermediate_dim
+        for k in (h, i):
+            if k % FP4_PACK_CHUNK:
+                raise ValueError(f"packed-FP4 experts need K % {FP4_PACK_CHUNK} == 0, got {k}")
+        scale_dtype = mxfp4_scale_dtype()
+        abstract = isinstance(self.wi_0.value, jax.ShapeDtypeStruct)
+
+        def make(shape, dtype, spec):
+            if abstract:
+                return nnx.Param(
+                    jax.ShapeDtypeStruct(
+                        shape, dtype, sharding=jax.sharding.NamedSharding(self.moe_mesh, spec)
+                    )
+                )
+            return nnx.Param(jnp.zeros(shape, dtype, out_sharding=spec), out_sharding=spec)
+
+        wi, wo = P("expert", None, "tensor"), P("expert", "tensor", None)
+        self.wi_0 = make((e, h // 8, i), jnp.uint32, wi)
+        self.wi_1 = make((e, h // 8, i), jnp.uint32, wi)
+        self.wo = make((e, i // 8, h), jnp.uint32, wo)
+        for name in ("wi_0_scale", "wi_1_scale", "wo_scale"):
+            if hasattr(self, name):
+                delattr(self, name)
+        self.wi_0_scale = make((e, h // 32, i), scale_dtype, self._fp4_scale_spec("wi_0_scale"))
+        self.wi_1_scale = make((e, h // 32, i), scale_dtype, self._fp4_scale_spec("wi_1_scale"))
+        self.wo_scale = make((e, i // 32, h), scale_dtype, self._fp4_scale_spec("wo_scale"))
+
     @named_scope
     def __call__(
         self,
@@ -728,10 +806,10 @@ class EPMoE(nnx.Module):
                     P("expert", None, "tensor"),
                     P("expert", None, "tensor"),
                     P("expert", "tensor", None),
-                    # scales [g, 1, 1, n]
-                    P("expert", None, None, "tensor"),
-                    P("expert", None, None, "tensor"),
-                    self._get_wo_scale_sharding(wo_scale),
+                    # scales [g, k_blocks, 1, n] (packed FP4: [g, K/32, n])
+                    self._scale_in_spec(w0_scale, "wi_0_scale"),
+                    self._scale_in_spec(w1_scale, "wi_1_scale"),
+                    self._scale_in_spec(wo_scale, "wo_scale"),
                     # biases [g, 1, n] (unused)
                     P("expert", None, "tensor"),
                     P("expert", None, "tensor"),
@@ -973,10 +1051,10 @@ class EPMoE(nnx.Module):
             P("expert", None, "tensor"),
             P("expert", "tensor", None),
             # scales [g, k_blocks, 1, n]: the wo scale is K-sharded when it is block-scaled
-            # (same rule as __call__; the per-channel form is replicated)
-            P("expert", None, None, "tensor"),
-            P("expert", None, None, "tensor"),
-            self._get_wo_scale_sharding(wo_scale),
+            # (same rule as __call__; the per-channel form is replicated). Packed FP4: [g, K/32, n].
+            self._scale_in_spec(None, "wi_0_scale"),
+            self._scale_in_spec(None, "wi_1_scale"),
+            self._scale_in_spec(wo_scale, "wo_scale"),
             # biases [g, 1, n] (unused)
             P("expert", None, "tensor"),
             P("expert", None, "tensor"),
@@ -1241,6 +1319,9 @@ class EPMoE(nnx.Module):
             maybe_quantize_lhs=act_q_dtype is not None,
             acc_dtype=jnp.float32,
         )
+        if self.fp4_packed:
+            # W4A16 MXFP4: uint32-packed E2M1 expanded in VMEM, bf16 activations
+            gmm_kwargs.update(rhs_fp4_packed=True, maybe_quantize_lhs=False)
 
         if (
             x.shape[0] <= _MOE_FUSED_GLU_DOWN_MAX_ROWS

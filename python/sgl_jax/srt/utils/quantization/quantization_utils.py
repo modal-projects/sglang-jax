@@ -146,7 +146,14 @@ def apply_linear_quantization(
     # Compile regex patterns from rules
     compiled_rules = []
     for rule in linear_rules:
-        pattern = re.compile(rule["module_path"])
+        pattern = re.compile(rule.get("module_path", ".*"))
+        # Optional exact module list (dot paths, e.g. set from a Quark checkpoint's per-module
+        # scheme): the rule then only applies to those modules.
+        module_paths = rule.get("module_paths")
+        if module_paths is not None:
+            from sgl_jax.srt.utils.quantization.quark import normalize_module_path
+
+            module_paths = frozenset(normalize_module_path(p) for p in module_paths)
         # Accept both sglang-jax style and Qwix-style field names.
         weight_dtype_str = rule.get("weight_dtype", rule.get("weight_qtype"))
         activation_dtype_str = rule.get("activation_dtype", rule.get("act_qtype"))
@@ -170,6 +177,7 @@ def apply_linear_quantization(
                 "weight_dtype": weight_dtype,
                 "activation_dtype": activation_dtype,
                 "weight_block_size": weight_block_size,
+                "module_paths": module_paths,
             }
         )
 
@@ -178,6 +186,11 @@ def apply_linear_quantization(
     def _find_matching_rule(path: str):
         """Find the first rule that matches the given module path."""
         for rule in compiled_rules:
+            if rule["module_paths"] is not None:
+                from sgl_jax.srt.utils.quantization.quark import normalize_module_path
+
+                if normalize_module_path(path) not in rule["module_paths"]:
+                    continue
             if rule["pattern"].match(path):
                 return rule
         return None

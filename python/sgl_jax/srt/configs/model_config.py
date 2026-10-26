@@ -418,6 +418,15 @@ class ModelConfig:
             ):
                 logger.info("Model has fp8 checkpoint, setting is_static_checkpoint=True")
                 self.quantization_config.is_static_checkpoint = True
+            if isinstance(hf_quant_config, dict) and hf_quant_config.get("quant_method") == "quark":
+                from sgl_jax.srt.utils.quantization.quark import apply_quark_scheme
+
+                logger.info("Model has a Quark checkpoint: applying its per-module scheme")
+                apply_quark_scheme(self.quantization_config, hf_quant_config)
+            elif self.quantization_config.moe_weight_format == "mxfp4":
+                raise ValueError(
+                    "quantization.moe.weight_format mxfp4 needs an MXFP4 (Quark) checkpoint"
+                )
             return self.quantization_config
 
         # 2. Check if HF model has quantization config
@@ -429,6 +438,15 @@ class ModelConfig:
         # If it's a dict (from HF config.json), try to convert it
         if isinstance(hf_quant_config, dict):
             quant_method = hf_quant_config.get("quant_method")
+
+            if quant_method == "quark":
+                from sgl_jax.srt.utils.quantization.quark import quark_quantization_config
+
+                logger.info(
+                    "Auto-detected AMD Quark checkpoint: MXFP4 routed experts stay packed "
+                    "(W4A16), FP8 block-128 linears stay FP8, excluded modules bf16."
+                )
+                return quark_quantization_config(hf_quant_config)
 
             if quant_method == "fp8":
                 logger.info("Auto-detected FP8 model. Creating QuantizationConfig for static fp8.")

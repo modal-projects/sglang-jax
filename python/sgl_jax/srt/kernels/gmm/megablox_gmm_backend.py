@@ -29,6 +29,8 @@ def gmm(
     activation_quantized_dtype: jnp.dtype | None = None,
     v2_tile_info: Any = None,
     glu_chunk: int | None = None,
+    rhs_e2m1_codes: bool = False,
+    rhs_fp4_packed: bool = False,
 ) -> jax.Array:
     """Dispatch GMM to v2 or v1, with optional activation quantization.
 
@@ -62,9 +64,17 @@ def gmm(
     if interpret is None:
         interpret = not is_tpu_runtime()
 
-    use_gmm_v2 = not interpret and is_supported_by_gmm_v2(
-        rhs_scale, maybe_quantize_lhs=maybe_quantize_lhs
+    use_gmm_v2 = not interpret and (
+        # packed FP4 is v2-only and may carry row-layout [G, K/32, N] scales
+        rhs_fp4_packed or is_supported_by_gmm_v2(rhs_scale, maybe_quantize_lhs=maybe_quantize_lhs)
     )
+    if rhs_fp4_packed and interpret:
+        # CPU (tests): the packed-FP4 kernel in Pallas TPU interpret mode.
+        return _gmm_v2_fp4_interpret(
+            lhs, rhs, group_sizes, rhs_scale, group_offset, preferred_element_type, zero_initialize
+        )
+    if (rhs_e2m1_codes or rhs_fp4_packed) and not use_gmm_v2:
+        raise NotImplementedError("E2M1-coded (MXFP4) weights require the GMM v2 TPU kernel")
 
     # Pad LHS to multiple of 128 (or 32 for v2) on TPU to avoid small/unaligned tiles
     m = lhs.shape[0]
@@ -86,6 +96,10 @@ def gmm(
             v2_kwargs["tile_info"] = v2_tile_info
         if glu_chunk:
             v2_kwargs["glu_chunk"] = int(glu_chunk)
+        if rhs_e2m1_codes:
+            v2_kwargs["rhs_e2m1_codes"] = True
+        if rhs_fp4_packed:
+            v2_kwargs["rhs_fp4_packed"] = True
         out = gmm_v2_kernel(
             lhs,
             rhs,
@@ -123,3 +137,46 @@ def gmm(
         out = out[:m]
 
     return out
+
+
+def _gmm_v2_fp4_interpret(
+    lhs, rhs, group_sizes, rhs_scale, group_offset, preferred_element_type, zero_initialize
+):
+    """Packed-FP4 gmm_v2 in Pallas TPU interpret mode (CPU tests; slow).
+
+    The interpreter cannot run the kernel's zero-init DMAs, so rows outside this shard's groups
+    are zeroed here, which is exactly what zero_initialize=True produces on TPU.
+    """
+    from jax.experimental.pallas import tpu as pltpu
+
+    m = lhs.shape[0]
+    pad = (-m) % 32
+    if pad:
+        lhs = jnp.pad(lhs, ((0, pad), (0, 0)))
+        group_sizes = group_sizes.at[-1].add(pad)
+    if group_offset is None:
+        group_offset = jnp.zeros((1,), jnp.int32)
+    group_offset = jnp.reshape(group_offset, (1,)).astype(jnp.int32)
+    out = gmm_v2_kernel(
+        lhs,
+        rhs,
+        group_sizes,
+        rhs_scale=rhs_scale,
+        group_offset=group_offset,
+        preferred_element_type=preferred_element_type,
+        maybe_quantize_lhs=False,
+        zero_initialize=False,
+        acc_dtype=jnp.float32,
+        rhs_fp4_packed=True,
+        # disable_bounds_checks=True on TPU: the bounded-slice lhs pipeline may read past a VMEM
+        # buffer for rows it then masks; mirror that instead of raising.
+        interpret=pltpu.InterpretParams(uninitialized_memory="zero", out_of_bounds_reads="uninitialized"),
+    )
+    gidx = jnp.arange(group_sizes.shape[0], dtype=jnp.int32)
+    local = (gidx >= group_offset[0]) & (gidx < group_offset[0] + rhs.shape[0])
+    start = jnp.sum(jnp.where(gidx < group_offset[0], group_sizes, 0))
+    end = start + jnp.sum(jnp.where(local, group_sizes, 0))
+    rows = jnp.arange(out.shape[0])[:, None]
+    out = jnp.where((rows >= start) & (rows < end), out, jnp.zeros((), out.dtype))
+    del zero_initialize  # always zero-filled (see docstring)
+    return out[:m]

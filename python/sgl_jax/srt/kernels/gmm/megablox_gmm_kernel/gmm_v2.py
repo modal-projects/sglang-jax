@@ -4,6 +4,8 @@ import functools
 from collections.abc import Callable
 from typing import Any
 
+import os
+
 import jax
 import jax.numpy as jnp
 from jax import lax
@@ -63,6 +65,73 @@ class InputConfigs:
     quant_block_size: int | None
     has_bias: bool = False
     has_scale: bool = False
+    # rhs is int4 holding E2M1 (FP4) bit codes, dequantized to bf16 in VMEM (W4A16).
+    e2m1_codes: bool = False
+    # rhs is packed MXFP4 (uint32 [G, K/8, N], see expand_fp4_packed_e5m2), expanded to E5M2 in VMEM.
+    fp4_packed: bool = False
+    # packed-FP4 scales given as [G, K/32, N] (row per K32 block) instead of [G, K/32, 1, N]
+    scale_2d: bool = False
+
+
+FP4_PACK_CHUNK = 64  # K rows per packing chunk: 8 packed uint32 rows -> 32 low + 32 high nibble rows
+FP4_PACKED_SCALE_EXP = 14  # expansion yields value * 2**-14; the caller's K32 scales carry 2**14
+FP4_PACKED_MAX_TILE_M = 32
+# Prefill: with at least this many rows per expert, expand each weight tile once, apply the K32
+# scales to the weights in bf16 (exact: power-of-two scale x E2M1 value) and run one full-K matmul
+# per tile with a large tile_m. The decode path (K32 block dots, tile_m <= 32) caps out near ~47 TF
+# on v5e; the full-K path pays a fixed ~2x expansion cost, so it wins from ~96 rows/expert
+# (v5e, 16 experts: 1024 rows 1123 vs 1263 us, 2048 rows 2196 vs 1264 us, 8192 rows 8679 vs 2479 us).
+FP4_PACKED_FULL_K_MIN_ROWS_PER_GROUP = 96
+FP4_PACKED_FULL_K_TILE_M = 256
+FP4_PACKED_FULL_K_MAX_TILE_N = 512
+
+
+def expand_fp4_packed_e5m2(words: jax.Array) -> jax.Array:
+    """Packed E2M1 -> E5M2, exactly, with SWAR mask/shift (4 values per 32-bit op).
+
+    words: uint32 [tk/8, tn]. In each 64-row K chunk c (packed rows 8c..8c+7, j = row % 8), byte b of
+    a word holds K row 64c + 4j + b in its low nibble and K row 64c + 32 + 4j + b in its high nibble.
+    For E2M1 code s|ee|m, the E5M2 byte s<<7 | ee<<2 | m<<1 equals value * 2**-14 (zero and the
+    0.5 subnormal included). Returns E5M2 [tk, tn] in natural K order.
+    """
+    tk8, tn = words.shape
+    nc = tk8 // 8
+    def to_e5m2(x):
+        b = ((x & jnp.uint32(0x08080808)) << 4) | ((x & jnp.uint32(0x07070707)) << 1)
+        return pltpu.bitcast(b, jnp.float8_e5m2).reshape(nc, 32, tn)
+    lo = to_e5m2(words & jnp.uint32(0x0F0F0F0F))
+    hi = to_e5m2((words >> 4) & jnp.uint32(0x0F0F0F0F))
+    return jnp.concatenate([lo, hi], axis=1).reshape(nc * FP4_PACK_CHUNK, tn)
+
+
+E2M1_DECODE = os.environ.get("SGLJAX_E2M1_DECODE", "bits")
+# "bits" decodes to E2M1 value * 2**-6; the caller's scales carry the 2**6 back.
+E2M1_DECODE_SCALE_EXP = {"bits": 6, "bits16": 6, "arith": 0, "unpack": 0}[E2M1_DECODE]
+# Profiling only (wrong numerics): skip the per-K32 scale multiply in the E2M1 path.
+_E2M1_PROFILE_NO_SCALE = os.environ.get("SGLJAX_E2M1_PROFILE_NO_SCALE", "0") == "1"
+
+
+def decode_e2m1_codes(v_int4: jax.Array, dtype) -> jax.Array:
+    """E2M1 nibble c stored as int4 v = c - 16*(c >= 8) -> its FP4 value (x 2**-E2M1_DECODE_SCALE_EXP).
+
+    "bits": FP4 -> FP8 by bit placement, no arithmetic. For c = s|ee|m, the E4M3 byte
+            s<<7 | ee<<3 | m<<2 equals value(c) * 2**-6 exactly, subnormals and zero included,
+            so the byte is (c & 8) << 4 | (c & 7) << 2; then a native f8 -> bf16 convert.
+    "arith": magnitude code m = v mod 8 -> 0.5*m + 0.5*max(m-4, 0) + max(m-6, 0), signed.
+    """
+    if E2M1_DECODE == "unpack":  # profiling only: int4 -> bf16 convert, no decode
+        return v_int4.astype(dtype)
+    if E2M1_DECODE in ("bits", "bits16"):
+        it = jnp.int16 if E2M1_DECODE == "bits16" else jnp.int32
+        c = v_int4.astype(it) & 15
+        byte = ((c & 8) << 4) | ((c & 7) << 2)
+        f8 = jax.lax.bitcast_convert_type(byte.astype(jnp.uint8), jnp.float8_e4m3fn)
+        return f8.astype(dtype)
+    v = v_int4.astype(jnp.bfloat16)
+    neg = v < 0
+    m = jnp.where(neg, v + 8, v)
+    mag = 0.5 * m + 0.5 * jnp.maximum(m - 4, 0) + jnp.maximum(m - 6, 0)
+    return jnp.where(neg, -mag, mag).astype(dtype)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -138,6 +207,10 @@ class IndexMaps:
         group_id = self.metadata_ref.gm_id_to_group_id[gm_id]
         return (group_id, k_id, 0, n_id)
 
+    def rhs_scale_rows_index_map(self, n_id: jax.Array, gm_id: jax.Array, k_id: jax.Array):
+        group_id = self.metadata_ref.gm_id_to_group_id[gm_id]
+        return (group_id, k_id, n_id)
+
     def out_index_map(self, n_id: jax.Array, gm_id: jax.Array, _: jax.Array):
         is_last_gm = gm_id == (pl.num_programs(1) - 1)
         m_start = self.metadata_ref.gm_id_to_m_offset[gm_id]
@@ -166,7 +239,7 @@ def generate_block_specs(
     )
 
     rhs_weight_spec = pl.BlockSpec(
-        (None, cfgs.tiles.tile_k, cfgs.tiles.tile_n),
+        (None, cfgs.tiles.tile_k // (8 if cfgs.rhs_cfgs.fp4_packed else 1), cfgs.tiles.tile_n),
         index_map.rhs_weight_index_map,
         pipeline_mode=pl.Buffered(buffer_count=3),
     )
@@ -183,10 +256,16 @@ def generate_block_specs(
                 cfgs.tiles.tile_k % rhs_block == 0
             ), f"block-scale: tile_k={cfgs.tiles.tile_k} must divide rhs_block={rhs_block}"
             num_scale_per_tile = cfgs.tiles.tile_k // rhs_block
-            rhs_scale_block_spec = pl.BlockSpec(
-                (None, num_scale_per_tile, 1, cfgs.tiles.tile_n),
-                index_map.rhs_scale_block_index_map,
-            )
+            if cfgs.rhs_cfgs.scale_2d:
+                rhs_scale_block_spec = pl.BlockSpec(
+                    (None, num_scale_per_tile, cfgs.tiles.tile_n),
+                    index_map.rhs_scale_rows_index_map,
+                )
+            else:
+                rhs_scale_block_spec = pl.BlockSpec(
+                    (None, num_scale_per_tile, 1, cfgs.tiles.tile_n),
+                    index_map.rhs_scale_block_index_map,
+                )
         else:
             rhs_scale_block_spec = pl.BlockSpec(
                 (None, None, 1, cfgs.tiles.tile_n),
@@ -261,7 +340,49 @@ def inner_kernel(
         )
 
         if cfgs.lhs_cfgs.quant_dtype is None:
-            if is_block_rhs_scale:
+            if cfgs.rhs_cfgs.fp4_packed:
+                # W4A16 MXFP4, exact: expand packed FP4 to E5M2 in VMEM (v6e's fast FP8 MXU format).
+                assert is_block_rhs_scale and rhs_block == 32 and valid_k == 0
+                tile_k, tile_n = cfgs.tiles.tile_k, cfgs.tiles.tile_n
+                w = expand_fp4_packed_e5m2(tiled_rhs)
+                if cfgs.tiles.tile_m > FP4_PACKED_MAX_TILE_M:
+                    # Prefill: scale the expanded weights in bf16 (exact: power-of-two scale x
+                    # E2M1 value) and run one full-K matmul.
+                    scale = tiled_rhs_ref.scale[...].astype(jnp.bfloat16)
+                    w = w.astype(jnp.bfloat16).reshape(tile_k // rhs_block, rhs_block, tile_n)
+                    w = (w * scale.reshape(tile_k // rhs_block, 1, tile_n)).reshape(tile_k, tile_n)
+                    acc = jnp.matmul(
+                        tiled_lhs.astype(jnp.bfloat16), w, preferred_element_type=jnp.float32
+                    ).astype(acc_ref.dtype)
+                else:
+                    # Decode: one K32-wide matmul per scale block, scaled on the f32 output.
+                    acc = jnp.zeros((cfgs.tiles.tile_m, tile_n), dtype=acc_ref.dtype)
+                    for blk_i in range(tile_k // rhs_block):
+                        lo_k = blk_i * rhs_block
+                        part = jnp.matmul(
+                            tiled_lhs[:, lo_k : lo_k + rhs_block],
+                            w[lo_k : lo_k + rhs_block],
+                            preferred_element_type=jnp.float32,
+                        )
+                        if cfgs.rhs_cfgs.scale_2d:
+                            acc += part * tiled_rhs_ref.scale[blk_i : blk_i + 1, :]
+                        else:
+                            acc += part * tiled_rhs_ref.scale[blk_i, 0:1, :]
+            elif cfgs.rhs_cfgs.e2m1_codes:
+                # W4A16 MXFP4: per-block matmuls would be K=32 wide, so dequantize the whole
+                # tile in VMEM (E2M1 decode x per-K32 scale) and run one full-K matmul.
+                assert is_block_rhs_scale, "E2M1 codes require block-wise rhs_scale"
+                tile_k, tile_n = tiled_rhs.shape
+                scale = tiled_rhs_ref.scale[...].astype(tiled_lhs.dtype)  # [tile_k/blk, 1, tn]
+                w = decode_e2m1_codes(tiled_rhs, tiled_lhs.dtype)
+                if not _E2M1_PROFILE_NO_SCALE:
+                    w = (w.reshape(tile_k // rhs_block, rhs_block, tile_n) * scale).reshape(
+                        tile_k, tile_n
+                    )
+                acc = jnp.matmul(
+                    tiled_lhs, w, preferred_element_type=jnp.float32
+                ).astype(acc_ref.dtype)
+            elif is_block_rhs_scale:
                 # W8A16 block-wise weight scale: split K by rhs_block, each block × its scale.
                 acc = jnp.zeros((cfgs.tiles.tile_m, cfgs.tiles.tile_n), dtype=acc_ref.dtype)
                 for blk_i, start_k in enumerate(range(0, cfgs.tiles.tile_k, rhs_block)):
@@ -741,8 +862,13 @@ def _kernel_main(
 
     # Bounded slice requires second last dim to be aligned to the sublane size.
     # rhs_ref uses static tiling thus reshape is not needed.
-    lhs_in = lhs_ref.reshape(-1, cfgs.dims.size_lhs_sublane, lhs_ref.shape[-1])
-    out_in = out_ref.reshape(-1, cfgs.dims.size_lhs_sublane, out_ref.shape[-1])
+    # (Interpret mode passes lhs/out already 3-D: the TPU interpreter has no ref reshape.)
+    lhs_in = lhs_ref if lhs_ref.ndim == 3 else lhs_ref.reshape(
+        -1, cfgs.dims.size_lhs_sublane, lhs_ref.shape[-1]
+    )
+    out_in = out_ref if out_ref.ndim == 3 else out_ref.reshape(
+        -1, cfgs.dims.size_lhs_sublane, out_ref.shape[-1]
+    )
     scratches = [partial_out_ref, acc_ref, metadata_ref]
     if cfgs.glu_chunk:
         scratches.append(glu_pre_ref)
@@ -835,11 +961,16 @@ def validate_inputs(
     rhs_bias: jax.Array | None,
     group_sizes: jax.Array,
     group_offset: jax.Array,
+    rhs_fp4_packed: bool = False,
 ):
     """Validates the inputs for the GMM kernel."""
 
     size_m = lhs.shape[0]
     size_group, size_k, size_n = rhs.shape
+    if rhs_fp4_packed:
+        assert rhs.dtype == jnp.uint32, rhs.dtype
+        size_k *= 8
+        rhs = jax.ShapeDtypeStruct((size_group, size_k, size_n), rhs.dtype)
     size_lhs_group = group_sizes.shape[0]
 
     assert size_group <= size_lhs_group
@@ -849,12 +980,15 @@ def validate_inputs(
         assert rhs_bias.shape == (size_group, 1, size_n)
     if rhs_scale is not None:
         num_k_blocks = rhs_scale.shape[1]
-        assert rhs_scale.shape == (
-            size_group,
-            num_k_blocks,
-            1,
-            size_n,
-        ), f"rhs_scale shape {rhs_scale.shape} != ({size_group}, {num_k_blocks}, 1, {size_n})"
+        if rhs_fp4_packed and rhs_scale.ndim == 3:
+            assert rhs_scale.shape == (size_group, num_k_blocks, size_n), rhs_scale.shape
+        else:
+            assert rhs_scale.shape == (
+                size_group,
+                num_k_blocks,
+                1,
+                size_n,
+            ), f"rhs_scale shape {rhs_scale.shape} != ({size_group}, {num_k_blocks}, 1, {size_n})"
         if num_k_blocks > 1:
             assert (
                 size_k % num_k_blocks == 0
@@ -888,9 +1022,8 @@ def get_cost_estimate(
 
     lhs_bytes = dims.size_m * dims.size_k * lhs.dtype.itemsize
 
-    rhs_bytes = (
-        dims.size_group * dims.size_k * dims.size_n * jax.dtypes.itemsize_bits(rhs.weight)
-    ) // 8
+    rhs_bits = 4 if rhs.weight.dtype == jnp.uint32 else jax.dtypes.itemsize_bits(rhs.weight)
+    rhs_bytes = (dims.size_group * dims.size_k * dims.size_n * rhs_bits) // 8
     if rhs.scale is not None:
         rhs_bytes += dims.size_n * jnp.dtype(jnp.float32).itemsize
     if rhs.bias is not None:
@@ -963,10 +1096,14 @@ def make_gmm_configs(
     zero_initialize: bool,
     skip_prefix: bool = False,
     glu_chunk: int | None = None,
+    rhs_e2m1_codes: bool = False,
+    rhs_fp4_packed: bool = False,
 ):
     """Fills the GMM config for the GMM kernel."""
 
-    dims = validate_inputs(lhs, rhs, rhs_scale, rhs_bias, group_sizes, group_offset)
+    dims = validate_inputs(
+        lhs, rhs, rhs_scale, rhs_bias, group_sizes, group_offset, rhs_fp4_packed=rhs_fp4_packed
+    )
 
     if rhs_scale is not None:
         has_scale = True
@@ -983,10 +1120,14 @@ def make_gmm_configs(
         quant_block_size=block_size,
         has_bias=rhs_bias is not None,
         has_scale=has_scale,
+        e2m1_codes=rhs_e2m1_codes,
+        fp4_packed=rhs_fp4_packed,
+        scale_2d=rhs_fp4_packed and rhs_scale is not None and rhs_scale.ndim == 3,
     )
 
     lhs_q_dtype = None
-    if maybe_quantize_lhs and rhs_quant_dtype is not None:
+    # E2M1-coded weights are dequantized in VMEM (W4A16): never quantize lhs for them.
+    if maybe_quantize_lhs and rhs_quant_dtype is not None and not (rhs_e2m1_codes or rhs_fp4_packed):
         lhs_q_dtype = select_lhs_quant_dtype(rhs_quant_dtype, pltpu.get_tpu_info())
 
     # Default lhs quantization block: input quantization involves reading all
@@ -1028,7 +1169,19 @@ def make_gmm_configs(
         tiles = tile_info
     else:
         lhs_q_dtype = lhs_q_dtype if lhs_q_dtype is not None else lhs.dtype
-        tiles = tile_info(lhs_q_dtype, rhs.dtype, dims, vmem_limit_bytes)
+        rhs_tile_dtype = jnp.int4 if rhs_fp4_packed else rhs.dtype
+        tiles = tile_info(lhs_q_dtype, rhs_tile_dtype, dims, vmem_limit_bytes)
+        if rhs_fp4_packed and dims.size_m >= FP4_PACKED_FULL_K_MIN_ROWS_PER_GROUP * dims.size_group:
+            # Prefill: full-K scaled-weight path (tile_m > FP4_PACKED_MAX_TILE_M selects it).
+            tiles = dataclasses.replace(
+                tiles,
+                tile_m=FP4_PACKED_FULL_K_TILE_M,
+                tile_n=min(tiles.tile_n, FP4_PACKED_FULL_K_MAX_TILE_N),
+            )
+        elif rhs_fp4_packed and tiles.tile_m > FP4_PACKED_MAX_TILE_M:
+            # The K32 block-dot loop's cost grows with rows per tile: on v5e/v6e tile_m > 32 is
+            # 1.7-2x slower at 48-96 rows/device (fp4p_tile_sweep), while <= 32 rows is unaffected.
+            tiles = dataclasses.replace(tiles, tile_m=FP4_PACKED_MAX_TILE_M)
         if glu_chunk:
             # The auto-tiler only sizes tile_n for VMEM (bf16 k=6144 n=4096 -> 1408 on v6e/v7x);
             # snap it down to whole [gate | up] chunk pairs so the epilogue tiles line up. Rounding
@@ -1038,6 +1191,8 @@ def make_gmm_configs(
                 tiles,
                 tile_n=align_glu_tile_n(tile_n=tiles.tile_n, size_n=dims.size_n, chunk=glu_chunk),
             )
+    if rhs_fp4_packed:
+        assert tiles.tile_k % FP4_PACK_CHUNK == 0 and dims.size_k % tiles.tile_k == 0, tiles
 
     if glu_chunk:
         validate_glu_chunk(tile_n=tiles.tile_n, size_n=dims.size_n, chunk=glu_chunk)
@@ -1096,6 +1251,9 @@ def get_metadata(cfgs: GmmConfigs):
         "zero_initialize",
         "skip_prefix_groups",
         "glu_chunk",
+        "rhs_e2m1_codes",
+        "rhs_fp4_packed",
+        "interpret",
     ]
 )
 def gmm_v2(
@@ -1117,6 +1275,9 @@ def gmm_v2(
     glu_chunk: (
         int | None
     ) = None,  # SwiGLU epilogue over interleaved [gate|up] chunks; out = size_n // 2
+    rhs_e2m1_codes: bool = False,
+    rhs_fp4_packed: bool = False,
+    interpret: Any = False,
 ) -> jax.Array:
     """GMM kernel implemented with emit_pipeline.
 
@@ -1138,6 +1299,10 @@ def gmm_v2(
           acc_dtype: Optional jnp.dtype for the accumulator.
           maybe_quantize_lhs: Quantize lhs if set to True and rhs is quantized.
           zero_initialize: Whether to initialize unvisited output elements to zero.
+          interpret: Pallas TPU interpret mode (CPU tests): False, True or a
+            ``pltpu.InterpretParams``. lhs/out are handed to the kernel 3-D
+            (the interpreter cannot reshape refs) and zero_initialize must be
+            False (its DMAs index the 2-D output).
 
     Returns:
           Output of shape [size_m, size_n].
@@ -1169,6 +1334,8 @@ def gmm_v2(
         zero_initialize=zero_initialize,
         skip_prefix=_SKIP_PREFIX_GROUPS if skip_prefix_groups is None else bool(skip_prefix_groups),
         glu_chunk=glu_chunk,
+        rhs_e2m1_codes=rhs_e2m1_codes,
+        rhs_fp4_packed=rhs_fp4_packed,
     )
     dims = cfgs.dims
     tiles = cfgs.tiles
@@ -1176,14 +1343,18 @@ def gmm_v2(
     # Prepare block specs.
     rhs_scale_spec = rhs_bias_spec = None
     if rhs_scale is not None:
-        rhs_scale = rhs_scale.astype(jnp.float32)
+        if not (rhs_e2m1_codes or rhs_fp4_packed):
+            # FP4 scales are powers of two: keep a bf16 copy as given (an f32 copy doubles the
+            # scale traffic); other paths compute in f32.
+            rhs_scale = rhs_scale.astype(jnp.float32)
         if rhs_scale.shape[1] > 1:
             block_size = cfgs.rhs_cfgs.quant_block_size
             num_k_tiles = pl.cdiv(dims.size_k, tiles.tile_k)
             target_k_blocks = num_k_tiles * (tiles.tile_k // block_size)
             if target_k_blocks > rhs_scale.shape[1]:
                 pad_k = target_k_blocks - rhs_scale.shape[1]
-                rhs_scale = jnp.pad(rhs_scale, ((0, 0), (0, pad_k), (0, 0), (0, 0)))
+                pad = ((0, 0), (0, pad_k)) + ((0, 0),) * (rhs_scale.ndim - 2)
+                rhs_scale = jnp.pad(rhs_scale, pad)
         rhs_scale_spec = pl.BlockSpec(memory_space=pltpu.HBM)
     if rhs_bias is not None:
         rhs_bias = rhs_bias.astype(jnp.float32)
@@ -1244,6 +1415,18 @@ def gmm_v2(
         aligned_n //= 2
     out_init = jax.ShapeDtypeStruct((dims.size_m, aligned_n), cfgs.out_dtype)
     rhs_weights = WeightsRef(weight=rhs, scale=rhs_scale, bias=rhs_bias)
+    interpret_kwargs = {}
+    if interpret:
+        if cfgs.zero_init:
+            raise NotImplementedError("gmm_v2 interpret mode requires zero_initialize=False")
+        sub = dims.size_lhs_sublane
+        if dims.size_m % sub:
+            raise ValueError(f"gmm_v2 interpret mode: size_m={dims.size_m} not a multiple of {sub}")
+        lhs = lhs.reshape(dims.size_m // sub, sub, lhs.shape[-1])
+        out_init = jax.ShapeDtypeStruct((dims.size_m // sub, sub, aligned_n), cfgs.out_dtype)
+        interpret_kwargs["interpret"] = (
+            interpret if isinstance(interpret, pltpu.InterpretParams) else pltpu.InterpretParams()
+        )
 
     prefetch = [group_sizes, group_offset]
     if cfgs.skip_prefix:
@@ -1252,7 +1435,7 @@ def gmm_v2(
         m_start = jnp.sum(jnp.where(gidx < group_offset[0], group_sizes, 0)).astype(jnp.int32)[None]
         prefetch.append(m_start)
 
-    return pl.pallas_call(
+    out = pl.pallas_call(
         functools.partial(kernel_main, cfgs=cfgs),
         out_shape=out_init,
         grid_spec=pltpu.PrefetchScalarGridSpec(
@@ -1275,7 +1458,11 @@ def gmm_v2(
         name=get_scope_name(dims, tiles),
         cost_estimate=get_cost_estimate(lhs, rhs_weights, out_init.dtype, dims),
         metadata=get_metadata(cfgs),
-    )(*prefetch, lhs, rhs_weights)[:, : dims.size_n]
+        **interpret_kwargs,
+    )(*prefetch, lhs, rhs_weights)
+    if interpret:
+        out = out.reshape(dims.size_m, aligned_n)
+    return out[:, : dims.size_n]
 
 
 def is_supported_by_gmm_v2(

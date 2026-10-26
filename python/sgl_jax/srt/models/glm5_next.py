@@ -23,9 +23,11 @@ there for the math and its provenance.
 from __future__ import annotations
 
 import logging
+from functools import partial
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import nnx
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
@@ -46,8 +48,19 @@ from sgl_jax.srt.models.glm5_moe import (
 )
 from sgl_jax.srt.layers.moe import EPMoE
 from sgl_jax.srt.models.kimi_linear import KimiDeltaAttention, kda_attention_mappings
+from sgl_jax.srt.utils.quantization.quark import FP8_BLOCK128, fp8_linear_module_paths
 
 logger = logging.getLogger(__name__)
+
+
+class _AllExcept:
+    """``x in _AllExcept(s)`` is ``x not in s`` (the mapping builder's "unquantized" test)."""
+
+    def __init__(self, keep):
+        self.keep = frozenset(keep)
+
+    def __contains__(self, item) -> bool:
+        return item not in self.keep
 
 
 class Glm5NextHC(nnx.Module):
@@ -524,6 +537,11 @@ class Glm5NextForConditionalGeneration(nnx.Module):
         unquantized = (
             frozenset(quant_config.ignored_layers or []) if is_static_quant else frozenset()
         )
+        quark = getattr(quant_config, "quark_scheme", None) if is_static_quant else None
+        if quark is not None:
+            # Quark: only the checkpoint's FP8 block-128 linears load as QuantizedLinear; the
+            # rest (bf16 and MXFP4 non-expert linears) load into plain LinearBase kernels.
+            unquantized = _AllExcept(fp8_linear_module_paths(quark))
         for i in range(cfg.num_hidden_layers):
             is_dense = i < cfg.first_k_dense_replace
             has_indexer = cfg.indexer_types[i] == "full"
@@ -562,9 +580,110 @@ class Glm5NextForConditionalGeneration(nnx.Module):
                 layer_map[f"{hfp}.index_kpool_compress_ape"] = WeightSpec(
                     target_path=f"{tgt}.kpool_ape", sharding=(None, None), transpose=False
                 )
+            if quark is not None:
+                layer_map = self._quark_layer_mappings(i, layer_map, quark, HF)
             mappings.update(layer_map)
             mappings.update(self._create_hc_mappings(i, HF))
         return mappings
+
+    def _quark_layer_mappings(self, i: int, layer_map: dict, scheme, HF: str) -> dict:
+        """Rewrite one layer's mappings for an AMD Quark MXFP4 checkpoint.
+
+        * FP8 block-128 linears: Quark names the block scale ``weight_scale`` (the official FP8
+          release: ``weight_scale_inv``; same tensor, same multiply-by-scale meaning).
+        * MXFP4 routed experts: one recipe per projection packs E2M1 codes into uint32
+          [E, K/8, N] + power-of-two [E, K/32, N] scales (EPMoE ``weight_format="mxfp4"``).
+        * MXFP4 non-expert linears (shared experts): dequantized exactly to the bf16 kernel.
+        Every MXFP4/FP8 module is checked against the checkpoint scheme; a mismatch raises.
+        """
+        from sgl_jax.srt.utils.quantization import mxfp4
+
+        cfg = self.config
+        out: dict = {}
+        hf_layer = f"{HF}.layers.{i}"
+        for key, spec in layer_map.items():
+            if key.endswith(".weight_scale_inv"):
+                key = key[: -len("_inv")]
+            out[key] = spec
+
+        def fmt(module: str) -> str:
+            return scheme.module_format(f"{hf_layer}.{module}")
+
+        # Every FP8 linear this layer maps must be FP8 in the checkpoint and vice versa.
+        for key, spec in out.items():
+            if isinstance(spec.target_path, str) and spec.target_path.endswith(".weight_q"):
+                module = key[len(hf_layer) + 1 : -len(".weight")]
+                if fmt(module) != FP8_BLOCK128:
+                    raise ValueError(f"{key}: mapped as FP8 but the checkpoint stores {fmt(module)}")
+
+        if i >= cfg.first_k_dense_replace:
+            if self.config.moe_backend != MoEBackend.EPMOE:
+                raise NotImplementedError("Quark MXFP4 routed experts require --moe-backend epmoe")
+            mlp = self.model.layers[i].mlp
+            if not getattr(mlp, "fp4_packed", False):
+                raise ValueError(f"layer {i}: EPMoE was not built with weight_format=mxfp4")
+            ptl = getattr(mlp, "physical_to_logical_map", None)
+            expert_ids = (
+                np.asarray(ptl) if ptl is not None else np.arange(cfg.n_routed_experts)
+            )
+            tgt = f"model.layers.{i}.mlp"
+            for name in ("wi_0", "wi_1", "wo"):
+                out.pop(f"{tgt}.{name}", None)
+                out.pop(f"{tgt}.{name}_scale", None)
+            for proj, name in (("gate_proj", "wi_0"), ("up_proj", "wi_1"), ("down_proj", "wo")):
+                srcs = []
+                for e in range(cfg.n_routed_experts):
+                    module = f"mlp.experts.{e}.{proj}"
+                    if fmt(module) != mxfp4.MXFP4_FORMAT:
+                        raise NotImplementedError(
+                            f"{hf_layer}.{module}: routed experts stored as {fmt(module)}, "
+                            "only MXFP4 routed experts are supported"
+                        )
+                    srcs += [f"{hf_layer}.{module}.weight", f"{hf_layer}.{module}.weight_scale"]
+                w_spec = ("expert", "tensor", None) if name == "wo" else ("expert", None, "tensor")
+                out[f"{tgt}.{name}"] = WeightSpec(
+                    [f"{tgt}.{name}", f"{tgt}.{name}_scale"],
+                    sources=tuple(srcs),
+                    recipe=partial(
+                        mxfp4.load_packed_fp4_experts,
+                        mesh=mlp.moe_mesh,
+                        weight_spec=w_spec,
+                        scale_spec=tuple(mlp._fp4_scale_spec(name + "_scale")),
+                        expert_ids=expert_ids,
+                        key=f"{hf_layer}.mlp.experts.{proj}",
+                    ),
+                )
+            if cfg.n_shared_experts:
+                st = f"model.layers.{i}.shared_experts"
+                for proj, axes in (
+                    ("gate_proj", (None, "tensor")),
+                    ("up_proj", (None, "tensor")),
+                    ("down_proj", ("tensor", None)),
+                ):
+                    module = f"mlp.shared_experts.{proj}"
+                    src = f"{hf_layer}.{module}"
+                    if fmt(module) == FP8_BLOCK128:
+                        continue  # stays a QuantizedLinear (mapped above)
+                    if fmt(module) != mxfp4.MXFP4_FORMAT:
+                        raise NotImplementedError(f"{src}: unsupported format {fmt(module)}")
+                    out.pop(f"{src}.weight", None)
+                    out[f"{src}.weight"] = WeightSpec(
+                        f"{st}.{proj}.weight",
+                        sources=(f"{src}.weight", f"{src}.weight_scale"),
+                        recipe=partial(
+                            mxfp4.load_dequantized_mxfp4_linear,
+                            mesh=self.mesh,
+                            sharding=axes,
+                            key=src,
+                        ),
+                    )
+        # Any remaining MXFP4 module of this layer would load its packed bytes as a bf16 kernel.
+        for key, spec in out.items():
+            if spec.recipe is None and key.endswith(".weight"):
+                module = key[len(hf_layer) + 1 : -len(".weight")]
+                if key.startswith(hf_layer + ".") and fmt(module) == mxfp4.MXFP4_FORMAT:
+                    raise NotImplementedError(f"{key}: MXFP4 tensor without an MXFP4 mapping")
+        return out
 
     @staticmethod
     def _create_hc_mappings(i: int, HF: str) -> dict:

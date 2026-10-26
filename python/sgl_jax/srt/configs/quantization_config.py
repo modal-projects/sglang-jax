@@ -120,6 +120,14 @@ class QuantizationConfig:
     # ``per_channel_requant_skip``: regex on the module path; matching layers keep block scales.
     linear_per_channel_requant: str | None = None
     linear_per_channel_requant_skip: str | None = None
+    # ``quantization.moe.weight_format``: storage format of static routed experts. ``"mxfp4"``
+    # keeps OCP MXFP4 experts (E2M1 + E8M0 per 32 K) packed as uint32 [E, K/8, N] with power-of-two
+    # [E, K/32, N] scales for the gmm_v2 packed-FP4 path (W4A16, exact); moe_weight_dtype is then
+    # the uint32 storage dtype.
+    moe_weight_format: str | None = None
+    # Parsed AMD Quark scheme (utils/quantization/quark.QuarkScheme) of a ``quant_method: quark``
+    # checkpoint: the per-module storage format the model's weight mappings follow.
+    quark_scheme: object | None = None
 
     def to_dict(self) -> dict:
         # Required by transformers.PretrainedConfig.to_json_string when this
@@ -145,6 +153,8 @@ class QuantizationConfig:
             "moe_weight_block_size_override": self.moe_weight_block_size_override,
             "linear_per_channel_requant": self.linear_per_channel_requant,
             "linear_per_channel_requant_skip": self.linear_per_channel_requant_skip,
+            "moe_weight_format": self.moe_weight_format,
+            "quark_scheme": self.quark_scheme.to_dict() if self.quark_scheme is not None else None,
         }
 
     @classmethod
@@ -202,7 +212,19 @@ class QuantizationConfig:
                 f"No moe section found in {resolved_path}. "
                 "The 'quantization.moe' section is required."
             )
-        moe_weight_dtype = _str_to_dtype(moe_section.get("weight_dtype"))
+        moe_weight_format = moe_section.get("weight_format")
+        if moe_weight_format not in (None, "mxfp4"):
+            raise ValueError(
+                f"quantization.moe.weight_format must be mxfp4 or null, got {moe_weight_format!r}"
+            )
+        if moe_weight_format == "mxfp4":
+            if moe_section.get("weight_dtype") not in (None, "uint32"):
+                raise ValueError("moe.weight_format mxfp4 stores uint32; omit moe.weight_dtype")
+            if moe_section.get("activation_dtype") is not None:
+                raise ValueError("moe.weight_format mxfp4 is W4A16: activation_dtype must be null")
+            moe_weight_dtype = jnp.uint32
+        else:
+            moe_weight_dtype = _str_to_dtype(moe_section.get("weight_dtype"))
         moe_activation_dtype = _str_to_dtype(moe_section.get("activation_dtype"))
         is_static_checkpoint = quant.get("is_static_checkpoint", False)
         weight_block_size = normalize_weight_block_size(quant.get("weight_block_size"))
@@ -238,6 +260,7 @@ class QuantizationConfig:
             moe_weight_block_size_override=moe_weight_block_size_override,
             linear_per_channel_requant=pc,
             linear_per_channel_requant_skip=pc_skip,
+            moe_weight_format=moe_weight_format,
         )
 
     @classmethod

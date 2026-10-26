@@ -1,0 +1,28 @@
+# AMD Quark MXFP4 checkpoints (quant_method: quark), e.g. amd/GLM-5.3-Flash-Quark-MXFP4, served
+# with the checkpoint's own weights, no requantization:
+# - routed experts: MXFP4 (E2M1 + E8M0 per 32 K) kept 4-bit in HBM, packed uint32 [E, K/8, N] with
+#   power-of-two [E, K/32, N] scales; gmm_v2 expands E2M1 -> E5M2 exactly in VMEM and runs bf16
+#   activations (W4A16; Quark's dynamic MXFP4 activations are an MI355X W4A4 detail).
+# - non-expert MXFP4 linears (GLM-5.3 shared experts): dequantized exactly to bf16 at load.
+# - FP8 block-128 linears (layer_quant_config overrides; GLM-5.3: dense MLP of layers 0-2 and the
+#   DSA q_a/q_b/kv_a/o projections): kept FP8 with their f32 block scales (W8A16 blockwise path;
+#   the scales are not powers of two, so a bf16 dequant would round).
+# - exclude list: bf16.
+# The checkpoint's scheme restricts the linear rule below to its FP8 modules (module_paths), and
+# is also auto-detected without this file. Requires --moe-backend epmoe.
+
+quantization:
+  is_static_checkpoint: true
+  weight_block_size: [128, 128]
+  allow_narrow_n_blockwise: true
+
+  linear:
+    rules:
+      - module_path: '.*'
+        weight_dtype: 'float8_e4m3fn'
+        activation_dtype: null
+    per_channel_requant: null
+
+  moe:
+    weight_format: 'mxfp4'
+    activation_dtype: null
