@@ -100,8 +100,54 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
 
         return DFlashDraftModel
 
+    @classmethod
+    def _resolve_draft_model_class(cls, server_args):
+        """DFLASH serves both DFlash and DFlash2 checkpoints; pick by declared architecture."""
+        if cls.algorithm != SpeculativeAlgorithm.DFLASH:
+            return cls._draft_model_class()
+        from sgl_jax.srt.hf_transformers_utils import get_config
+
+        try:
+            hf_config = get_config(
+                server_args.speculative_draft_model_path,
+                trust_remote_code=True,
+                revision=server_args.speculative_draft_model_revision,
+            )
+            architectures = list(getattr(hf_config, "architectures", None) or [])
+        except Exception as e:  # keep the v1 behavior if the config cannot be read here
+            logger.warning("DFLASH: could not read draft architectures (%s); using DFlash v1.", e)
+            architectures = []
+        if any(a in ("DFlash2DraftModel", "MiniMaxDFlash2DraftModel") for a in architectures):
+            from sgl_jax.srt.models.dflash import DFlash2DraftModel
+
+            return DFlash2DraftModel
+        return cls._draft_model_class()
+
     def _validate_draft_model(self, draft_model):
-        pass
+        if not getattr(draft_model, "uses_candidate_selector", False):
+            return
+        # DFlash2: the grouped convs index tokens by in-block position, so every draft row
+        # must carry the full block (anchor at position 0, masks after it).
+        if self.sample_from_anchor:
+            raise ValueError(
+                "DFlash2 drafts propose from the mask slots; disable "
+                "--speculative-sample-from-anchor."
+            )
+        if self.draft_query_tokens != self.block_size:
+            raise ValueError("DFlash2 requires draft_query_tokens == verify block size.")
+        vocab = int(draft_model.candidate_selector.vocab_size)
+        if vocab != self._target_vocab_size:
+            raise ValueError(
+                f"DFlash2 selector vocab ({vocab}) != target vocab ({self._target_vocab_size})."
+            )
+        if self.block_size != draft_model.options.block_size:
+            logger.warning(
+                "DFlash2: verify width %d differs from the checkpoint block_size %d; the grouped "
+                "convolutions adopt the verify width (as upstream set_block_size).",
+                self.block_size,
+                draft_model.options.block_size,
+            )
+        draft_model.set_block_size(self.block_size)
 
     def __init__(self, server_args, target_worker: ModelWorker):
         super().__init__(
@@ -124,7 +170,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             mesh=self.mesh,
             req_to_token_pool=self.req_to_token_pool,
             is_draft_worker=True,
-            model_class=self._draft_model_class(),
+            model_class=self._resolve_draft_model_class(server_args),
         )
         draft_model = self.draft_model_runner.model
         # Alias the KV allocator so draft block allocation draws from the same
@@ -860,13 +906,23 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             )
             proposal_hidden = draft_hidden[:, sample_start:, :]
             proposal_flat = proposal_hidden.reshape((-1, proposal_hidden.shape[-1]))
-            logits = jnp.dot(
-                proposal_flat,
-                lm_head.T,
-                out_sharding=logits_sharding,
-            )[:, :vocab_size]
-            base_logits = logits.reshape((*proposal_hidden.shape[:-1], vocab_size))
-            draft_next = model.sample_block_tokens(base_logits, seed[:, 0])
+            if getattr(model, "uses_candidate_selector", False):
+                # DFlash2: top-K target-head candidates per slot + low-rank transition
+                # lattice, walked greedily from the verified anchor.
+                draft_next = model.propose_block_tokens(
+                    proposal_hidden,
+                    lm_head,
+                    seed[:, 0],
+                    vocab_size=vocab_size,
+                )
+            else:
+                logits = jnp.dot(
+                    proposal_flat,
+                    lm_head.T,
+                    out_sharding=logits_sharding,
+                )[:, :vocab_size]
+                base_logits = logits.reshape((*proposal_hidden.shape[:-1], vocab_size))
+                draft_next = model.sample_block_tokens(base_logits, seed[:, 0])
             seed = jax.sharding.reshard(seed, cache_row_sharding)
             draft_next = jax.sharding.reshard(draft_next, cache_row_sharding)
             draft_token = jnp.concatenate([seed, draft_next], axis=1).reshape(-1)

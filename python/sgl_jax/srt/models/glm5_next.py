@@ -274,9 +274,22 @@ class Glm5NextDecoderLayer(nnx.Module):
         return hidden_states, attn_state, topk_ids
 
 
+def hc_contract(streams: jax.Array, hc_mult: int) -> jax.Array:
+    """[..., hc*D] mHC residual streams -> [..., D] mean over the hc streams.
+
+    Upstream SGLang's ``hc_contract`` (sglang/kernels/ops/layernorm/mhc.py), which GLM-5.3's
+    ``Glm5NextModel._prepare_aux_hidden_state`` applies to every DFlash tap. Accumulated in f32.
+    """
+    lead = streams.shape[:-1]
+    out = streams.reshape(*lead, hc_mult, -1).astype(jnp.float32).mean(axis=-2)
+    return out.astype(streams.dtype)
+
+
 class Glm5NextModel(nnx.Module):
     def __init__(self, config: Glm5NextConfig, mesh, dtype=jnp.bfloat16):
         self.config = config
+        # DFlash taps: capture the residual entering layer i (= completed output of layer i-1).
+        self.layers_to_capture: list[int] = []
         self.embed_tokens = Embed(
             num_embeddings=config.vocab_size,
             features=config.hidden_size,
@@ -302,8 +315,13 @@ class Glm5NextModel(nnx.Module):
         layers_kv_fused, layers_idx_fused, layers_topk_ids = [], [], []
         layers_recurrent, layers_conv = [], []
         dsa_topk, dsa_topk_pages = None, None
+        aux_hidden_states = []
 
-        for layer in self.layers:
+        for layer_id, layer in enumerate(self.layers):
+            if layer_id in self.layers_to_capture:
+                # DFlash tap (upstream glm5_next): the full mHC residual (all hc streams, pre
+                # norm, post the previous layer's hc_post), contracted by the stream mean.
+                aux_hidden_states.append(hc_contract(hidden_states, hc))
             hidden_states, attn_state, topk_ids = layer(
                 forward_batch.positions,
                 hidden_states,
@@ -328,6 +346,8 @@ class Glm5NextModel(nnx.Module):
                     dsa_topk_pages = attn_state.topk_pages
             layers_topk_ids.append(topk_ids)
 
+        if len(self.layers) in self.layers_to_capture:
+            aux_hidden_states.append(hc_contract(hidden_states, hc))
         # Collapse the hc streams into one before the final norm: mean over the hc axis.
         hidden_states = hidden_states.reshape(hidden_states.shape[0], hc, -1).mean(axis=1)
         hidden_states = self.norm(hidden_states)
@@ -337,6 +357,7 @@ class Glm5NextModel(nnx.Module):
             layers_idx_fused,
             (layers_recurrent, layers_conv),
             layers_topk_ids,
+            aux_hidden_states,
         )
 
 
@@ -393,13 +414,27 @@ class Glm5NextForConditionalGeneration(nnx.Module):
             mesh=mesh,
             enable_dp_lm_head=getattr(config, "enable_dp_lm_head", False),
         )
+        self.capture_aux_hidden_states = False
+
+    def set_dflash_layers_to_capture(self, layer_ids: list[int]):
+        """Capture DFlash target taps: the mHC-contracted residual after each listed layer."""
+        if layer_ids is None:
+            raise ValueError("DFLASH requires explicit target layer ids.")
+        num_layers = self.config.num_hidden_layers
+        bad = [i for i in layer_ids if not 0 <= int(i) < num_layers]
+        if bad:
+            raise ValueError(f"DFLASH target_layer_ids {bad} outside [0, {num_layers}).")
+        self.capture_aux_hidden_states = True
+        # Capturing before layer k + 1 gives the completed output of layer k (upstream).
+        self.model.layers_to_capture = [int(i) + 1 for i in layer_ids]
 
     def __call__(self, forward_batch: ForwardBatch, memory_pools, logits_metadata: LogitsMetadata):
-        hidden, kv_fused, idx_fused, recurrent, topk_ids = self.model(forward_batch, memory_pools)
-        if not self.config.tie_word_embeddings:
-            output = self.logits_processor(hidden, self.lm_head, logits_metadata)
-        else:
-            output = self.logits_processor(hidden, self.model.embed_tokens, logits_metadata)
+        hidden, kv_fused, idx_fused, recurrent, topk_ids, aux = self.model(
+            forward_batch, memory_pools
+        )
+        aux = aux if self.capture_aux_hidden_states else None
+        head = self.model.embed_tokens if self.config.tie_word_embeddings else self.lm_head
+        output = self.logits_processor(hidden, head, logits_metadata, aux_hidden_states=aux)
         kv_update = (kv_fused, idx_fused) if idx_fused else kv_fused
         return (
             output,
