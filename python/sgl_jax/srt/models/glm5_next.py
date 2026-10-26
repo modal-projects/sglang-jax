@@ -677,12 +677,18 @@ class Glm5NextForConditionalGeneration(nnx.Module):
                             key=src,
                         ),
                     )
-        # Any remaining MXFP4 module of this layer would load its packed bytes as a bf16 kernel.
+        # A remaining projection the scheme calls MXFP4 would load packed bytes as a bf16 kernel
+        # (Quark quantizes nn.Linear modules only: norms, convs and raw params are never MXFP4).
         for key, spec in out.items():
-            if spec.recipe is None and key.endswith(".weight"):
-                module = key[len(hf_layer) + 1 : -len(".weight")]
-                if key.startswith(hf_layer + ".") and fmt(module) == mxfp4.MXFP4_FORMAT:
-                    raise NotImplementedError(f"{key}: MXFP4 tensor without an MXFP4 mapping")
+            target = spec.target_path if isinstance(spec.target_path, str) else ""
+            if (
+                spec.recipe is None
+                and key.startswith(hf_layer + ".")
+                and key.endswith("_proj.weight")
+                and target.endswith(".weight")
+                and fmt(key[len(hf_layer) + 1 : -len(".weight")]) == mxfp4.MXFP4_FORMAT
+            ):
+                raise NotImplementedError(f"{key}: MXFP4 tensor without an MXFP4 mapping")
         return out
 
     @staticmethod
