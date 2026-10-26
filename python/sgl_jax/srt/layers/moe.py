@@ -1307,6 +1307,12 @@ class EPMoE(nnx.Module):
             intermediate_layer = jax.nn.silu(layer_w0) * layer_w1
         elif self.activation == "gelu":
             intermediate_layer = jax.nn.gelu(layer_w0) * layer_w1
+        elif self.activation == "silu_clamp":
+            # silu_and_mul_clamp (GLM-5.3 / DeepSeek-V4 reference; same order as Glm5MLP):
+            # gate <= limit before the silu, |up| <= limit
+            gate = jax.nn.silu(jnp.minimum(layer_w0, self.swiglu_limit))
+            up = jnp.clip(layer_w1, -self.swiglu_limit, self.swiglu_limit)
+            intermediate_layer = gate * up
         elif self.activation == "swigluoai":
             gate = jnp.clip(layer_w0, max=self.swiglu_limit)
             up = jnp.clip(layer_w1, -self.swiglu_limit, self.swiglu_limit)

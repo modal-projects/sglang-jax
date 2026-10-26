@@ -44,6 +44,7 @@ from sgl_jax.srt.models.glm5_moe import (
     fused_v2_moe,
     moe_router,
 )
+from sgl_jax.srt.layers.moe import EPMoE
 from sgl_jax.srt.models.kimi_linear import KimiDeltaAttention, kda_attention_mappings
 
 logger = logging.getLogger(__name__)
@@ -220,9 +221,43 @@ class Glm5NextDecoderLayer(nnx.Module):
             self.is_moe_layer = True
 
     def _build_moe(self, config: Glm5NextConfig, mesh, layer_id: int, dtype) -> None:
-        """Routed + shared experts on the fused v2 kernel, the only one with the swiglu clamp."""
+        """Routed + shared experts: the fused v2 kernel (routed and shared in one kernel), or EPMoE
+        (megablox GMM; int4/fp8 expert checkpoints) with the shared expert as a separate MLP. Both
+        apply GLM-5.3's SwiGLU clamp. The fused v2 kernel allocates DMA semaphores per local expert,
+        which does not fit TPU v6e's semaphore memory with all 288 experts on one chip."""
         self.moe_gate, self.topk = moe_router(config, mesh, layer_id)
-        self.mlp = fused_v2_moe(config, mesh, layer_id, dtype, config.n_shared_experts)
+        self.moe_backend = getattr(config, "moe_backend", MoEBackend.FUSED_V2)
+        if self.moe_backend == MoEBackend.EPMOE:
+            self.mlp = EPMoE(
+                hidden_size=config.hidden_size,
+                num_experts=config.n_routed_experts,
+                num_experts_per_tok=config.num_experts_per_tok,
+                intermediate_dim=config.moe_intermediate_size,
+                mesh=mesh,
+                ep_size=getattr(config, "ep_size", 1),
+                weight_dtype=dtype,
+                dtype=dtype,
+                activation="silu_clamp",
+                swiglu_limit=config.swiglu_limit,
+                layer_id=layer_id,
+                quantization_config=getattr(config, "quantization_config", None),
+            )
+            self.shared_experts = (
+                Glm5MLP(
+                    hidden_size=config.hidden_size,
+                    intermediate_size=config.moe_intermediate_size * config.n_shared_experts,
+                    mesh=mesh,
+                    layer_id=layer_id,
+                    dtype=dtype,
+                    use_fused=False,
+                    swiglu_limit=config.swiglu_limit,
+                )
+                if config.n_shared_experts
+                else None
+            )
+        else:
+            self.mlp = fused_v2_moe(config, mesh, layer_id, dtype, config.n_shared_experts)
+            self.shared_experts = None
 
     def __call__(
         self,
@@ -261,11 +296,16 @@ class Glm5NextDecoderLayer(nnx.Module):
             topk_weights, topk_ids = self.topk(
                 router_logits, self.moe_gate.bias.value, dispatch_info=dispatch_info
             )
-            # SwiGLU clamp on the routed and (in-kernel) shared experts.
-            limit = self.swiglu_limit
-            mlp_out = self.mlp(
-                h, topk_weights, topk_ids, swiglu_limit=limit, shared_swiglu_limit=limit
-            )
+            if self.moe_backend == MoEBackend.EPMOE:
+                mlp_out = self.mlp(h, topk_weights, topk_ids)
+                if self.shared_experts is not None:
+                    mlp_out = mlp_out + self.shared_experts(h)
+            else:
+                # SwiGLU clamp on the routed and (in-kernel) shared experts.
+                limit = self.swiglu_limit
+                mlp_out = self.mlp(
+                    h, topk_weights, topk_ids, swiglu_limit=limit, shared_swiglu_limit=limit
+                )
         else:
             mlp_out = self.mlp(h)
             topk_ids = None
@@ -370,8 +410,8 @@ class Glm5NextForConditionalGeneration(nnx.Module):
         if getattr(config, "quantization_config", None) is not None:
             cfg.quantization_config = config.quantization_config
         cfg.moe_backend = getattr(config, "moe_backend", MoEBackend.EPMOE)
-        if cfg.moe_backend != MoEBackend.FUSED_V2:
-            raise ValueError("GLM-5.3-Flash currently supports only --moe-backend fused_v2")
+        if cfg.moe_backend not in (MoEBackend.FUSED_V2, MoEBackend.EPMOE):
+            raise ValueError("GLM-5.3-Flash supports --moe-backend fused_v2 or epmoe")
         if not getattr(config, "use_dsa_sparse", False):
             raise ValueError("GLM-5.3-Flash requires --attention-backend dsa_sparse")
         cfg.ep_size = getattr(config, "ep_size", 1)
