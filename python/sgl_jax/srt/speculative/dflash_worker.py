@@ -10,6 +10,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from sgl_jax.srt.layers.attention.linear.kda_backend import commit_recurrent_verify
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 from sgl_jax.srt.managers.tp_worker import ModelWorker
@@ -1054,6 +1055,9 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             accept_lens_out = jax.sharding.reshard(accept_lens_out, token_sharding)
             next_token_ids_flat = jax.sharding.reshard(next_token_ids_flat, token_sharding)
             new_verified_id = jax.sharding.reshard(new_verified_id, token_sharding)
+            # Hybrid linear-attention targets (KDA): verify wrote no recurrent state; commit
+            # each layer's state at the accepted position (seed + accepted drafts).
+            pool_updates = commit_recurrent_verify(pool_updates, accept_lens_out + 1)
             new_seq_lens = (target_prefix_lens + 1 + accept_lens_out).astype(jnp.int32)
             new_seq_lens = jax.sharding.reshard(new_seq_lens, token_sharding)
             updated_relay_buffers = relay_buffers
