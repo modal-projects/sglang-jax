@@ -14,6 +14,7 @@ from sgl_jax.srt.kernels.kda import (
     naive_recurrent_kda,
     resident_pipeline_kda_fwd,
 )
+from sgl_jax.srt.kernels.kda.decode import kda_decode_pool
 from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
     LinearRecurrentAttnBackend,
 )
@@ -32,6 +33,22 @@ def l2_normalize(x: jax.Array, epsilon: float = 1e-6) -> jax.Array:
     x32 = x.astype(jnp.float32)
     rstd = jax.lax.rsqrt(jnp.sum(jnp.square(x32), axis=-1, keepdims=True) + epsilon)
     return (x32 * rstd).astype(x.dtype)
+
+
+def kda_decode_kernel_choice() -> str:
+    """``SGLANG_JAX_KDA_DECODE_KERNEL``: ``pallas`` | ``naive`` | ``auto`` (default).
+
+    ``auto`` selects the in-place Pallas decode kernel on TPU and the naive JAX
+    recurrence elsewhere (CPU tests, other backends).
+    """
+    choice = os.environ.get("SGLANG_JAX_KDA_DECODE_KERNEL", "auto").strip().lower()
+    if choice == "auto":
+        return "pallas" if jax.default_backend() == "tpu" else "naive"
+    if choice not in ("pallas", "naive"):
+        raise ValueError(
+            f"SGLANG_JAX_KDA_DECODE_KERNEL must be 'pallas', 'naive' or 'auto', got {choice!r}"
+        )
+    return choice
 
 
 class KDAAttnBackend(LinearRecurrentAttnBackend):
@@ -55,8 +72,13 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         **kwargs,
     ) -> jax.Array:
         recurrent_indices = self.forward_metadata.recurrent_indices
+        # Pallas decode reads/writes the SSM pool in place: no gathered copy.
+        pallas_decode = (
+            forward_batch.forward_mode == ForwardMode.DECODE
+            and kda_decode_kernel_choice() == "pallas"
+        )
         ssm_states, conv_states = self.get_state(
-            recurrent_state_pool, layer.layer_id, recurrent_indices
+            recurrent_state_pool, layer.layer_id, recurrent_indices, skip_ssm=pallas_decode
         )
         q_conv_w = layer.q_conv1d.weight.value
         k_conv_w = layer.k_conv1d.weight.value
@@ -125,27 +147,44 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
                 scale=layer.scale,
             )
         elif forward_batch.forward_mode == ForwardMode.DECODE:
-            # Decode uses the recurrent JAX path, so normalize Q/K before the
-            # call. Mega KDA performs the same normalization inside its prefill
-            # kernel; the chunked prefill fallback normalizes in its branch.
+            # Decode uses the recurrent path (naive JAX or Pallas), so normalize
+            # Q/K before the call. Mega KDA performs the same normalization
+            # inside its prefill kernel; the chunked prefill fallback
+            # normalizes in its branch.
             q = l2_normalize(q)
             k = l2_normalize(k)
-            output, new_recurrent = self._forward_decode(
-                q,
-                k,
-                v,
-                a,
-                b,
-                ssm_states,
-                layer,
-                scale=layer.scale,
-            )
+            if pallas_decode:
+                full_recurrent, _ = self.get_layer_cache(recurrent_state_pool, layer.layer_id)
+                output, new_ssm_full = self._forward_decode_pallas(
+                    q,
+                    k,
+                    v,
+                    a,
+                    b,
+                    full_recurrent,
+                    recurrent_indices,
+                    layer,
+                    scale=layer.scale,
+                )
+                new_recurrent = None
+            else:
+                output, new_recurrent = self._forward_decode(
+                    q,
+                    k,
+                    v,
+                    a,
+                    b,
+                    ssm_states,
+                    layer,
+                    scale=layer.scale,
+                )
         else:
             raise NotImplementedError(f"KDA does not support {forward_batch.forward_mode}")
 
-        new_ssm_full = self.set_ssm_state(
-            recurrent_state_pool, layer.layer_id, recurrent_indices, new_recurrent
-        )
+        if not pallas_decode:
+            new_ssm_full = self.set_ssm_state(
+                recurrent_state_pool, layer.layer_id, recurrent_indices, new_recurrent
+            )
         new_conv_full_list = self.set_conv_state(
             recurrent_state_pool, layer.layer_id, recurrent_indices, new_conv_packed
         )
@@ -156,17 +195,21 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         track_indices = self.forward_metadata.recurrent_track_indices
         if track_indices is not None:
             track_mask = self.forward_metadata.recurrent_track_mask
-            new_ssm_full = self.set_ssm_track_state(
-                new_ssm_full, track_indices, track_mask, new_recurrent
-            )
+            if not pallas_decode:  # the Pallas kernel already wrote the track slots
+                new_ssm_full = self.set_ssm_track_state(
+                    new_ssm_full, track_indices, track_mask, new_recurrent
+                )
             new_conv_full_list = self.set_conv_track_state(
                 new_conv_full_list, track_indices, track_mask, new_conv_packed
             )
 
         return output.reshape(output.shape[0], -1), (new_ssm_full, new_conv_full_list)
 
-    def get_state(self, recurrent_state_pool, layer_id, recurrent_indices):
-        """Return per-request views of (ssm, conv) state for this layer."""
+    def get_state(self, recurrent_state_pool, layer_id, recurrent_indices, skip_ssm=False):
+        """Return per-request views of (ssm, conv) state for this layer.
+
+        ``skip_ssm``: return ``None`` for ssm (the caller reads the pool in place).
+        """
         recurrent_buffer, conv_buffer_list = self.get_layer_cache(
             recurrent_state_pool,
             layer_id,
@@ -177,13 +220,15 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         )
         conv_buffer = conv_buffer_list[0]
 
-        ssm = jax.shard_map(
-            lambda buf, idx: buf[idx],
-            mesh=self.mesh,
-            in_specs=(P("data", "tensor", None, None), P("data")),
-            out_specs=P("data", "tensor", None, None),
-            check_vma=False,
-        )(recurrent_buffer, recurrent_indices)
+        ssm = None
+        if not skip_ssm:
+            ssm = jax.shard_map(
+                lambda buf, idx: buf[idx],
+                mesh=self.mesh,
+                in_specs=(P("data", "tensor", None, None), P("data")),
+                out_specs=P("data", "tensor", None, None),
+                check_vma=False,
+            )(recurrent_buffer, recurrent_indices)
 
         conv = jax.shard_map(
             lambda buf, idx: buf[idx],
@@ -195,7 +240,8 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
 
         has_initial_state = self.forward_metadata.has_initial_state
         if has_initial_state is not None:
-            ssm = jnp.where(has_initial_state[:, None, None, None], ssm, 0.0)
+            if ssm is not None:
+                ssm = jnp.where(has_initial_state[:, None, None, None], ssm, 0.0)
             conv = jnp.where(has_initial_state[:, None, None], conv, 0.0)
 
         return ssm, conv
@@ -526,6 +572,45 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         )
         return sharded(q, k, v, g, beta, initial_state)
 
+    @named_scope("kda_decode_pallas")
+    def _forward_decode_pallas(
+        self,
+        q: jax.Array,
+        k: jax.Array,
+        v: jax.Array,
+        g: jax.Array,
+        beta: jax.Array,
+        full_recurrent: jax.Array,
+        recurrent_indices: jax.Array,
+        layer: RadixLinearAttention,
+        scale: float | None = None,
+    ) -> tuple[jax.Array, jax.Array]:
+        """Single-step decode with the Pallas kernel, in place on the SSM pool.
+
+        Same math and slot semantics as ``get_state`` -> ``_forward_decode`` ->
+        ``set_ssm_state`` (-> ``set_ssm_track_state``), but each request's state
+        is DMA'd straight from / to its pool slot (pool is input/output aliased),
+        so the [B, H, K, V] state is read once and written once.
+
+        Returns (o [B, H, V], new full pool buffer).
+        """
+        g = self._fused_kda_gate(layer, g)
+        md = self.forward_metadata
+        return kda_decode_pool_sharded(
+            self.mesh,
+            q,
+            k,
+            v,
+            g,
+            beta,
+            full_recurrent,
+            recurrent_indices,
+            scale=scale,
+            has_initial_state=md.has_initial_state,
+            track_indices=md.recurrent_track_indices,
+            track_mask=md.recurrent_track_mask,
+        )
+
     def _fused_kda_gate(
         self,
         layer: RadixLinearAttention,
@@ -592,4 +677,78 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         )(q_state, k_state, v_state)
 
 
-__all__ = ["KDAAttnBackend"]
+def kda_decode_pool_sharded(
+    mesh,
+    q,
+    k,
+    v,
+    g,
+    beta,
+    full_recurrent,
+    recurrent_indices,
+    *,
+    scale=None,
+    has_initial_state=None,
+    track_indices=None,
+    track_mask=None,
+    **kernel_kwargs,
+):
+    """``kda_decode_pool`` under ``shard_map`` over ("data", "tensor").
+
+    Pool [S, H, K, V] is P("data", "tensor", None, None) with per-DP-rank local
+    slot indices (slot 0 = dummy), matching ``RecurrentStatePool``.
+    """
+    has_track = track_indices is not None
+    if has_track and track_mask is None:
+        track_mask = jnp.ones_like(track_indices)
+
+    def _call(q, k, v, g, beta, pool, idx, *meta):
+        meta = list(meta)
+        hi = meta.pop(0) if has_initial_state is not None else None
+        tidx, tmask = (meta[0], meta[1]) if has_track else (None, None)
+        return kda_decode_pool(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            pool,
+            idx,
+            scale=scale,
+            has_initial_state=hi,
+            track_idx=tidx,
+            track_mask=tmask,
+            **kernel_kwargs,
+        )
+
+    meta = []
+    if has_initial_state is not None:
+        meta.append(has_initial_state)
+    if has_track:
+        meta += [track_indices, track_mask]
+    o, new_pool = jax.shard_map(
+        _call,
+        mesh=mesh,
+        in_specs=(
+            P("data", "tensor", None),  # q [B, H, K]
+            P("data", "tensor", None),  # k [B, H, K]
+            P("data", "tensor", None),  # v [B, H, V]
+            P("data", "tensor", None),  # g [B, H, K]
+            P("data", "tensor"),  # beta [B, H]
+            P("data", "tensor", None, None),  # pool [S, H, K, V]
+            P("data"),  # recurrent_indices [B]
+            *([P("data")] * len(meta)),
+        ),
+        out_specs=(
+            P("data", "tensor", None),  # o [B, H, V]
+            P("data", "tensor", None, None),  # pool
+        ),
+        check_vma=False,
+    )(q, k, v, g, beta, full_recurrent, recurrent_indices, *meta)
+    if has_track:
+        # Same donated-buffer aliasing guard as set_ssm_track_state.
+        new_pool = jax.lax.optimization_barrier(new_pool)
+    return o, new_pool
+
+
+__all__ = ["KDAAttnBackend", "kda_decode_kernel_choice", "kda_decode_pool_sharded"]
