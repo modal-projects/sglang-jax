@@ -120,3 +120,78 @@ def resolve_mask_token_id(
             "Vocab resizing is not supported in minimal mode."
         )
     return resolved
+
+
+@dataclass(frozen=True)
+class DFlashModelOptions:
+    """Draft-architecture options read from ``dflash_config`` (DFlash v1 and DFlash2).
+
+    Mirrors the fields of upstream SGLang's ``parse_dflash_draft_config`` that change the
+    draft forward: the grouped dynamic convolution (``conv_*``), the candidate selector
+    (``selector_*``) and the unary-logit transform (``output_multiplier`` / softcap).
+    """
+
+    block_size: int
+    conv_kernel_size: int
+    conv_group_size: int
+    selector_rank: int
+    selector_top_k: int
+    output_multiplier: float
+    final_logit_softcapping: float | None
+    mask_token_id: int | None
+
+    @property
+    def has_conv(self) -> bool:
+        return self.conv_kernel_size > 0
+
+    @property
+    def has_selector(self) -> bool:
+        return self.selector_rank > 0
+
+
+def _nonneg_int(dflash: dict, key: str) -> int:
+    value = dflash.get(key, 0)
+    if value is None:
+        return 0
+    if isinstance(value, bool) or int(value) != value or int(value) < 0:
+        raise ValueError(f"DFLASH {key} must be a non-negative int, got {value!r}.")
+    return int(value)
+
+
+def get_dflash_model_options(hf_config) -> DFlashModelOptions:
+    """Parse and validate the draft-forward options of a DFlash/DFlash2 HF config."""
+    dflash = _get_dflash_subconfig(hf_config)
+    block_size = int(_cfg_get(dflash, hf_config, "block_size", DEFAULT_DFLASH_BLOCK_SIZE))
+    conv_kernel_size = _nonneg_int(dflash, "conv_kernel_size")
+    conv_group_size = _nonneg_int(dflash, "conv_group_size")
+    if bool(conv_kernel_size) != bool(conv_group_size):
+        raise ValueError(
+            "DFLASH grouped convolution needs conv_kernel_size and conv_group_size together, "
+            f"got conv_kernel_size={conv_kernel_size}, conv_group_size={conv_group_size}."
+        )
+    selector_rank = _nonneg_int(dflash, "selector_rank")
+    selector_top_k = _nonneg_int(dflash, "selector_top_k")
+    if bool(selector_rank) != bool(selector_top_k):
+        raise ValueError(
+            "DFLASH selector needs selector_rank and selector_top_k together, "
+            f"got rank={selector_rank}, top_k={selector_top_k}."
+        )
+    output_multiplier = float(dflash.get("output_multiplier", 1.0) or 1.0)
+    if output_multiplier <= 0:
+        raise ValueError("DFLASH output_multiplier must be positive.")
+    softcap = float(dflash.get("final_logit_softcapping") or 0.0)
+    # Upstream features this port does not implement must fail loudly, not silently drift.
+    for key in ("attention_sink_bias", "attention_value_scale", "projector_type"):
+        if dflash.get(key) not in (None, False, "", "linear"):
+            raise NotImplementedError(f"DFLASH dflash_config.{key}={dflash[key]!r} is not ported.")
+    mask_token_id = _cfg_get(dflash, hf_config, "mask_token_id", None)
+    return DFlashModelOptions(
+        block_size=block_size,
+        conv_kernel_size=conv_kernel_size,
+        conv_group_size=conv_group_size,
+        selector_rank=selector_rank,
+        selector_top_k=selector_top_k,
+        output_multiplier=output_multiplier,
+        final_logit_softcapping=softcap if softcap > 0 else None,
+        mask_token_id=None if mask_token_id is None else int(mask_token_id),
+    )

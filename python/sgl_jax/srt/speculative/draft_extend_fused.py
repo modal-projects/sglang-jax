@@ -1270,6 +1270,21 @@ def _make_target_verify_metadata(
     page_size: int,
     dp_size: int,
 ):
+    if type(old_metadata).__name__ == "HybridLinearAttnBackendMetadata":
+        # Hybrid (KDA/GDN + full attention) targets: only the full-attention metadata depends
+        # on sequence lengths; the linear part (block-aligned cu_q_lens, recurrent slots) is
+        # already in TARGET_VERIFY form from get_forward_metadata.
+        return type(old_metadata)(
+            full_attn_metadata=_make_target_verify_metadata(
+                old_metadata.full_attn_metadata,
+                verify_seq_lens,
+                allocated_lens,
+                speculative_num_draft_tokens=speculative_num_draft_tokens,
+                page_size=page_size,
+                dp_size=dp_size,
+            ),
+            linear_attn_metadata=old_metadata.linear_attn_metadata,
+        )
 
     valid = verify_seq_lens > 0
     extend_seq_lens = jnp.where(

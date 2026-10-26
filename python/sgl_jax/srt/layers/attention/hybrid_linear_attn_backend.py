@@ -95,6 +95,23 @@ class LinearRecurrentAttnBackend(AttentionBackend):
         elif batch.forward_mode == ForwardMode.DECODE:
             single_cu = np.arange(batch.per_dp_bs_size + 1, dtype=np.int32)
             cu_q_lens = np.tile(single_cu, batch.dp_size)
+        elif batch.forward_mode == ForwardMode.TARGET_VERIFY:
+            # Linear-chain verify: every (padded) request carries the same T draft tokens.
+            # The KDA verify kernel reshapes tokens to [rows, T], so the token axis must be
+            # exactly rows * T (no extra bucket padding).
+            rows = batch.dp_size * batch.per_dp_bs_size
+            num_tokens = len(batch.input_ids)
+            spec = getattr(batch, "spec_info", None) or getattr(batch, "spec_info_padded", None)
+            T = getattr(spec, "draft_token_num", None)
+            if T is None and rows:
+                T = num_tokens // rows
+            if rows == 0 or int(T) * rows != num_tokens:
+                raise ValueError(
+                    f"TARGET_VERIFY needs {rows} rows x {T} tokens, got {num_tokens} tokens."
+                )
+            T = int(T)
+            single_cu = np.arange(batch.per_dp_bs_size + 1, dtype=np.int32) * T
+            cu_q_lens = np.tile(single_cu, batch.dp_size)
         else:
             raise ValueError(f"Invalid forward mode: {batch.forward_mode}")
 

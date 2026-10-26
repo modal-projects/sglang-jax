@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import os
 from typing import TYPE_CHECKING
 
@@ -32,6 +33,154 @@ def l2_normalize(x: jax.Array, epsilon: float = 1e-6) -> jax.Array:
     x32 = x.astype(jnp.float32)
     rstd = jax.lax.rsqrt(jnp.sum(jnp.square(x32), axis=-1, keepdims=True) + epsilon)
     return (x32 * rstd).astype(x.dtype)
+
+
+@dataclasses.dataclass
+class KDAVerifyRecord:
+    """What a TARGET_VERIFY step needs to commit a KDA layer's state at the accepted position.
+
+    A verify step runs T = draft_token_num tokens per request through the recurrence *without*
+    writing the pool (the drafts may be rejected). Instead of checkpointing T full
+    ``[H, K, V]`` states per request, it keeps the per-token recurrence inputs (k, v, gate,
+    beta after conv/gate/l2norm: O(T * H * (2K + V)) per request) and the pre-verify state;
+    :func:`commit_kda_verify` replays only the accepted prefix (masked, so shapes stay
+    static) and scatters the result. The short-conv cache at the accepted position is the
+    last K-1 raw inputs of ``conv0 ++ x[:accepted]``.
+    """
+
+    ssm_full: jax.Array  # [slots, H, K, V] pool buffer (unchanged by verify)
+    conv_full: jax.Array  # [slots, proj, W] packed pool buffer (unchanged by verify)
+    recurrent_indices: jax.Array  # [B]
+    h0: jax.Array  # [B, H, K, V] pre-verify state
+    conv0_q: jax.Array  # [B, Dq, W] pre-verify conv caches, per stream
+    conv0_k: jax.Array
+    conv0_v: jax.Array
+    x_q: jax.Array  # [B*T, Dq] raw (pre-conv) projections, per stream
+    x_k: jax.Array
+    x_v: jax.Array
+    k: jax.Array  # [B, T, H, K] l2-normalized keys
+    v: jax.Array  # [B, T, H, V]
+    g: jax.Array  # [B, T, H, K] activated log-space gate
+    beta: jax.Array  # [B, T, H]
+    mesh: jax.sharding.Mesh = dataclasses.field(metadata=dict(static=True), default=None)
+
+
+jax.tree_util.register_dataclass(KDAVerifyRecord)
+
+
+def _scatter_rows(buf, idx, val):
+    """``buf[idx] = val`` except rows with idx == 0 (padding / per-rank dummy slot)."""
+    keep = (idx == 0).reshape((-1,) + (1,) * (buf.ndim - 1))
+    return buf.at[idx].set(jnp.where(keep, buf[idx], val))
+
+
+def commit_kda_verify(record: KDAVerifyRecord, num_tokens: jax.Array):
+    """State after the first ``num_tokens[b]`` verify tokens of each request, scattered.
+
+    ``num_tokens`` = committed tokens per request (the seed + accepted drafts, i.e.
+    ``accept_len + 1`` in the DFlash worker), in ``[0, T]``. Returns the new
+    ``(ssm_full, [conv_full])`` pool buffers for the layer.
+    """
+    mesh = record.mesh
+    T = record.k.shape[1]
+    W = record.conv0_q.shape[-1]
+    steps = num_tokens.astype(jnp.int32)
+
+    def _replay(k, v, g, beta, h0, steps):
+        live = jnp.arange(T, dtype=jnp.int32)[None, :] < steps[:, None]  # [B, T]
+        # A masked step is an exact no-op: exp(0) decay and a zero delta update.
+        g = jnp.where(live[..., None, None], g, jnp.zeros_like(g))
+        beta = jnp.where(live[..., None], beta, jnp.zeros_like(beta))
+        _, state = naive_recurrent_kda(
+            jnp.zeros_like(k),
+            k,
+            v,
+            g,
+            beta,
+            initial_state=h0,
+            output_final_state=True,
+        )
+        return state.astype(h0.dtype)
+
+    new_state = jax.shard_map(
+        _replay,
+        mesh=mesh,
+        in_specs=(
+            P("data", None, "tensor", None),
+            P("data", None, "tensor", None),
+            P("data", None, "tensor", None),
+            P("data", None, "tensor"),
+            P("data", "tensor", None, None),
+            P("data"),
+        ),
+        out_specs=P("data", "tensor", None, None),
+        check_vma=False,
+    )(record.k, record.v, record.g, record.beta, record.h0, steps)
+
+    def _conv_window(c0, x, steps):
+        b, d, _ = c0.shape
+        x = jnp.swapaxes(x.reshape(b, T, d), 1, 2).astype(c0.dtype)  # [B, D, T]
+        window = jnp.concatenate([c0, x], axis=-1)  # [B, D, W + T]
+        idx = steps[:, None] + jnp.arange(W, dtype=jnp.int32)[None, :]
+        return jnp.take_along_axis(window, idx[:, None, :], axis=-1)
+
+    conv_window = jax.shard_map(
+        lambda cq, ck, cv, xq, xk, xv, st: jnp.concatenate(
+            [_conv_window(cq, xq, st), _conv_window(ck, xk, st), _conv_window(cv, xv, st)],
+            axis=1,
+        ),
+        mesh=mesh,
+        in_specs=(P("data", "tensor", None),) * 3 + (P("data", "tensor"),) * 3 + (P("data"),),
+        out_specs=P("data", "tensor", None),
+        check_vma=False,
+    )
+    new_conv = conv_window(
+        record.conv0_q,
+        record.conv0_k,
+        record.conv0_v,
+        record.x_q,
+        record.x_k,
+        record.x_v,
+        steps,
+    )
+
+    ssm_full = jax.shard_map(
+        _scatter_rows,
+        mesh=mesh,
+        in_specs=(P("data", "tensor", None, None), P("data"), P("data", "tensor", None, None)),
+        out_specs=P("data", "tensor", None, None),
+        check_vma=False,
+    )(record.ssm_full, record.recurrent_indices, new_state)
+    conv_full = jax.shard_map(
+        _scatter_rows,
+        mesh=mesh,
+        in_specs=(P("data", "tensor", None), P("data"), P("data", "tensor", None)),
+        out_specs=P("data", "tensor", None),
+        check_vma=False,
+    )(record.conv_full, record.recurrent_indices, new_conv)
+    return ssm_full, [conv_full]
+
+
+def commit_recurrent_verify(pool_updates: dict, num_tokens: jax.Array) -> dict:
+    """Replace every :class:`KDAVerifyRecord` in a model's pool updates by committed buffers.
+
+    No-op for models without recurrent layers or outside TARGET_VERIFY. Expects the
+    ``{"recurrent_state_pool": (layers_recurrent, layers_conv)}`` layout the KDA models
+    (Kimi-Linear, GLM-5.3) return.
+    """
+    rec = pool_updates.get("recurrent_state_pool") if isinstance(pool_updates, dict) else None
+    if rec is None:
+        return pool_updates
+    layers_recurrent, layers_conv = rec
+    if not any(isinstance(r, KDAVerifyRecord) for r in layers_recurrent):
+        return pool_updates
+    layers_recurrent, layers_conv = list(layers_recurrent), list(layers_conv)
+    for i, r in enumerate(layers_recurrent):
+        if isinstance(r, KDAVerifyRecord):
+            layers_recurrent[i], layers_conv[i] = commit_kda_verify(r, num_tokens)
+    updates = dict(pool_updates)
+    updates["recurrent_state_pool"] = (layers_recurrent, layers_conv)
+    return updates
 
 
 class KDAAttnBackend(LinearRecurrentAttnBackend):
@@ -69,7 +218,9 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         q_state, k_state, v_state = self._unpack_conv_states(conv_states)
 
         cu_q_lens = self.forward_metadata.cu_q_lens
-        if forward_batch.forward_mode == ForwardMode.EXTEND:
+        is_verify = forward_batch.forward_mode == ForwardMode.TARGET_VERIFY
+        x_q, x_k, x_v = q, k, v  # raw projections, kept for the verify commit
+        if forward_batch.forward_mode == ForwardMode.EXTEND or is_verify:
             q, q_state_new = self._short_conv_extend(
                 q, q_conv_w, q_state, cu_q_lens, layer.activation
             )
@@ -124,6 +275,35 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
                 layer,
                 scale=layer.scale,
             )
+        elif is_verify:
+            # Multi-token window per request (T = draft tokens), no pool writes: the commit
+            # after acceptance replays the accepted prefix (commit_kda_verify).
+            q = l2_normalize(q)
+            k = l2_normalize(k)
+            g = self._fused_kda_gate(layer, a)
+            output, (k_b, v_b, g_b, beta_b) = self._forward_verify(
+                q, k, v, g, b, ssm_states, scale=layer.scale
+            )
+            _, conv_full_list = self.get_layer_cache(recurrent_state_pool, layer.layer_id)
+            ssm_full, _ = self.get_layer_cache(recurrent_state_pool, layer.layer_id)
+            record = KDAVerifyRecord(
+                ssm_full=ssm_full,
+                conv_full=conv_full_list[0],
+                recurrent_indices=recurrent_indices,
+                h0=ssm_states,
+                conv0_q=q_state,
+                conv0_k=k_state,
+                conv0_v=v_state,
+                x_q=x_q,
+                x_k=x_k,
+                x_v=x_v,
+                k=k_b,
+                v=v_b,
+                g=g_b,
+                beta=beta_b,
+                mesh=self.mesh,
+            )
+            return output.reshape(output.shape[0], -1), (record, list(conv_full_list))
         elif forward_batch.forward_mode == ForwardMode.DECODE:
             # Decode uses the recurrent JAX path, so normalize Q/K before the
             # call. Mega KDA performs the same normalization inside its prefill
@@ -526,6 +706,39 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         )
         return sharded(q, k, v, g, beta, initial_state)
 
+    @named_scope("kda_verify")
+    def _forward_verify(self, q, k, v, g, beta, initial_state, scale=None):
+        """T tokens per request (block-aligned rows) through the exact recurrence.
+
+        Returns the per-token outputs [B*T, H, V] and the per-token recurrence inputs
+        reshaped [B, T, ...] for :func:`commit_kda_verify`.
+        """
+        bsz = initial_state.shape[0]
+        n = q.shape[0]
+        if n % bsz:
+            raise ValueError(f"KDA verify needs B*T rows: got {n} tokens for {bsz} requests.")
+        T = n // bsz
+
+        def _kernel(q, k, v, g, beta, h0):
+            b_local = h0.shape[0]
+            r = lambda x: x.reshape((b_local, T) + x.shape[1:])
+            q, k, v, g, beta = map(r, (q, k, v, g, beta))
+            o, _ = naive_recurrent_kda(
+                q, k, v, g, beta, scale=scale, initial_state=h0, output_final_state=False
+            )
+            return o.reshape((b_local * T,) + o.shape[2:]), k, v, g, beta
+
+        tok = P("data", "tensor", None)
+        blk = P("data", None, "tensor", None)
+        o, k_b, v_b, g_b, beta_b = jax.shard_map(
+            _kernel,
+            mesh=self.mesh,
+            in_specs=(tok, tok, tok, tok, P("data", "tensor"), P("data", "tensor", None, None)),
+            out_specs=(tok, blk, blk, blk, P("data", None, "tensor")),
+            check_vma=False,
+        )(q, k, v, g, beta, initial_state)
+        return o, (k_b, v_b, g_b, beta_b)
+
     def _fused_kda_gate(
         self,
         layer: RadixLinearAttention,
@@ -592,4 +805,4 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         )(q_state, k_state, v_state)
 
 
-__all__ = ["KDAAttnBackend"]
+__all__ = ["KDAAttnBackend", "KDAVerifyRecord", "commit_kda_verify", "commit_recurrent_verify"]
