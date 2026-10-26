@@ -16,6 +16,8 @@ any exponent bf16 can represent (``c`` in [1, 254] covers bf16's normal range; Q
 
 from __future__ import annotations
 
+import sys
+
 import ml_dtypes
 import numpy as np
 
@@ -98,11 +100,11 @@ def mxfp4_pair_to_packed_fp4(
     k = 2 * half_k
     if k % FP4_PACK_CHUNK:
         raise ValueError(f"{key}: K={k} is not a multiple of {FP4_PACK_CHUNK}")
-    nib = unpack_e2m1_codes(packed)  # [N, K]
-    c6 = nib.T.reshape(k // 64, 2, 8, 4, n).astype(np.uint32)  # [chunk, half, j, b, n]
-    words = np.zeros((k // 64, 8, n), np.uint32)
-    for b in range(4):
-        words |= (c6[:, 0, :, b, :] << (8 * b)) | (c6[:, 1, :, b, :] << (8 * b + 4))
+    nib = unpack_e2m1_codes(packed).T.reshape(k // 64, 2, 8, 4, n)  # [chunk, half, j, b, n]
+    byte = nib[:, 0] | (nib[:, 1] << np.uint8(4))  # [chunk, j, b, n] uint8
+    # little-endian host (asserted): byte b of each word is bits 8b..8b+7
+    assert sys.byteorder == "little"
+    words = np.ascontiguousarray(byte.transpose(0, 1, 3, 2)).view(np.uint32)[..., 0]
     exp = codes.astype(np.int32) - E8M0_BIAS + FP4_PACKED_SCALE_EXP
     scale = np.ldexp(np.ones(codes.shape, np.float32), exp).T
     scale_c = scale.astype(scale_dtype)
