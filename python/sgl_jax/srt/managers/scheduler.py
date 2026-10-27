@@ -202,6 +202,73 @@ def validate_dflash_request(req) -> str | None:
     return None
 
 
+
+class StepTimingAccumulator:
+    """Per-rank host-time breakdown of event_loop_overlap (SGLANG_STEP_TIMING=N).
+
+    Phases (ms, mean over the window):
+      recv     recv_requests incl. zmq pub/sub broadcast wait on ranks != 0
+      proc_in  process_input_requests
+      sched    get_next_batch_to_run
+      launch   run_batch: batch prep + H2D + enqueue to the forward thread
+      result   process_batch_result of the previous batch, of which
+               (qget) wait for the forward thread to dispatch it,
+               (d2h) wait for its next_token_ids on host (= device time not
+               hidden by overlap), (lwait) wait for the current launch.
+      loop     wall time between consecutive loop starts (= TPOT in decode).
+    """
+
+    def __init__(self, node_rank: int, every: int):
+        self.node_rank = node_rank
+        self.every = every
+        self._reset()
+        self._prev_start = None
+
+    def _reset(self):
+        self.n = 0
+        self.sums = [0.0] * 9
+        self.max_loop = 0.0
+        self.bs = 0
+        self.decode = 0
+
+    def add(self, t0, t0r, t1, t2, t2b, t3, resolve, batch):
+        loop = (t0 - self._prev_start) if self._prev_start is not None else 0.0
+        self._prev_start = t0
+        q, d, lw = resolve if resolve else (0.0, 0.0, 0.0)
+        vals = (t0r - t0, t1 - t0r, t2 - t1, t2b - t2, t3 - t2b, q, d, lw, loop)
+        for i, v in enumerate(vals):
+            self.sums[i] += v
+        self.max_loop = max(self.max_loop, loop)
+        self.n += 1
+        try:
+            self.bs += batch.batch_size()
+        except Exception:
+            pass
+        if batch.forward_mode is not None and batch.forward_mode.is_decode():
+            self.decode += 1
+        if self.n >= self.every:
+            m = [1e3 * v / self.n for v in self.sums]
+            logger.info(
+                "[step-timing r%d] n=%d decode=%d bs=%.1f loop=%.3f (max %.3f) | recv=%.3f "
+                "proc_in=%.3f sched=%.3f launch=%.3f result=%.3f (qget=%.3f d2h=%.3f "
+                "lwait=%.3f) ms",
+                self.node_rank,
+                self.n,
+                self.decode,
+                self.bs / self.n,
+                m[8],
+                1e3 * self.max_loop,
+                m[0],
+                m[1],
+                m[2],
+                m[3],
+                m[4],
+                m[5],
+                m[6],
+                m[7],
+            )
+            self._reset()
+
 class Scheduler(
     SchedulerOutputProcessorMixin,
     SchedulerProfilerMixin,
@@ -1011,6 +1078,10 @@ class Scheduler(
         """A scheduler loop that overlaps the CPU processing and Accelerator computation."""
         self.result_queue = deque()
         _pd_iter_trace = self.pd == "pathways" and os.environ.get("SGLANG_PD_DBG")
+        # SGLANG_STEP_TIMING=N: every N iterations that ran a batch, log this
+        # rank's mean host time per loop phase (opt-in; off by default).
+        _step_timing_n = int(os.environ.get("SGLANG_STEP_TIMING", "0") or 0)
+        _st = StepTimingAccumulator(self.node_rank, _step_timing_n) if _step_timing_n > 0 else None
 
         if self.pd == "pathways":
             import gc as _gc
@@ -1025,16 +1096,18 @@ class Scheduler(
             )
 
         while True:
-            _it0 = time.perf_counter() if _pd_iter_trace else 0.0
+            _timed = _pd_iter_trace or _st is not None
+            _it0 = time.perf_counter() if _timed else 0.0
             recv_reqs = (
                 self._comm_backend.recv_requests()
                 if self._comm_backend is not None
                 else self.recv_requests()
             )
+            _it0r = time.perf_counter() if _st is not None else 0.0
             # Assign DP rank to incoming requests
             recv_reqs = self.select_dp_for_request(recv_reqs)
             self.process_input_requests(recv_reqs)
-            _it1 = time.perf_counter() if _pd_iter_trace else 0.0
+            _it1 = time.perf_counter() if _timed else 0.0
 
             # Skip batch processing when engine is paused
             if self._engine_paused:
@@ -1042,7 +1115,7 @@ class Scheduler(
 
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
-            _it2 = time.perf_counter() if _pd_iter_trace else 0.0
+            _it2 = time.perf_counter() if _timed else 0.0
 
             # HiCache: stage_load was issued during last round; flush must wait
             # for that forward's replace_all to avoid racing the donated kv_buffer.
@@ -1054,11 +1127,14 @@ class Scheduler(
                     self.last_batch.launch_done.wait()
                 self._flush_pending_h2d()
 
+            _it2b = _it2
             if batch:
                 batch.launch_done = threading.Event()
                 with jax.profiler.TraceAnnotation("run_batch"):
                     result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), result))
+                if _st is not None:
+                    _it2b = time.perf_counter()
 
                 if self.last_batch is None:
                     # Create a dummy first batch to start the pipeline for overlap schedule.
@@ -1095,6 +1171,19 @@ class Scheduler(
                 self.on_idle()
 
             self.last_batch = batch
+            if _st is not None and batch is not None:
+                _st.add(
+                    _it0,
+                    _it0r,
+                    _it1,
+                    _it2,
+                    _it2b,
+                    time.perf_counter(),
+                    getattr(self.tp_worker, "last_resolve_timing", None),
+                    batch,
+                )
+                if hasattr(self.tp_worker, "last_resolve_timing"):
+                    self.tp_worker.last_resolve_timing = None
             if _pd_iter_trace:
                 _it3 = time.perf_counter()
                 if _it3 - _it0 > 0.5:

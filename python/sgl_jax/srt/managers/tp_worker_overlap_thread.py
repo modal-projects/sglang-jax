@@ -49,6 +49,7 @@ class ModelWorkerClient:
         self.max_total_num_tokens = self.worker.max_total_num_tokens
         self.device = self.worker.device
         self.cur_sampling_info = None
+        self.last_resolve_timing = None
 
         # Init future mappings. The map is indexed by req_pool_idx + 1 (one
         # pending-token slot per request slot; index 0 reserved), not by a
@@ -143,6 +144,10 @@ class ModelWorkerClient:
                         )
                     )
                 self.future_token_ids_map = new_future_map
+                # next_token_ids is already replicated (P()) inside the fused
+                # jit; start its D2H now, same as the unfused path below.
+                if hasattr(next_token_ids, "copy_to_host_async"):
+                    next_token_ids.copy_to_host_async()
                 self._wait_pd_prefill_kv_ready()
                 self.output_queue.put((None, logits_output, next_token_ids, cache_miss_count))
                 continue
@@ -263,6 +268,8 @@ class ModelWorkerClient:
         if launch_done is not None:
             launch_done.wait()
         _r4 = time.perf_counter()
+        # (qget, d2h, launch_wait) seconds; read by SGLANG_STEP_TIMING.
+        self.last_resolve_timing = (_r1 - _r0, _r2 - _r1, _r4 - _r3)
         if os.environ.get("SGLANG_PD_DBG") and _r4 - _r0 > 0.5:
             import gc as _gc
 

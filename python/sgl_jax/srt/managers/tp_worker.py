@@ -57,6 +57,32 @@ def _iter_padded_input_logprob_reqs(model_worker_batch, padded_rows: int):
             cum += plen
 
 
+def fused_decode_sample_enabled(server_args: ServerArgs, is_draft_worker: bool = False) -> bool:
+    """Whether decode batches run resolve-future + model + sampler + set-future
+    as ONE jitted program (ModelRunner.forward_and_sample) instead of ~5 jits
+    plus the eager resolve_future_token_ids ops.
+
+    - SGLANG_PD_FUSE_SAMPLE=1: original Pathways-PD-only switch (unchanged).
+    - SGLANG_FUSE_DECODE_SAMPLE=1: opt-in for regular (non-PD) serving, aimed
+      at multi-host slices where every separate program launch is gated by the
+      slowest host's dispatch. Off by default; speculative decoding keeps the
+      unfused path (its verify batches are not plain decode anyway).
+
+    AOT artifacts contain the model forward only; sampling remains separate.
+    """
+    if server_args.aot_model_dir:
+        return False
+    if server_args.pd_disaggregation == "pathways":
+        return os.getenv("SGLANG_PD_FUSE_SAMPLE") == "1"
+    return (
+        os.getenv("SGLANG_FUSE_DECODE_SAMPLE") == "1"
+        and not is_draft_worker
+        and not server_args.speculative_algorithm
+        and not server_args.pd_disaggregation
+        and server_args.disaggregation_mode in (None, "null")
+    )
+
+
 class ModelWorker:
     """A tensor parallel model worker."""
 
@@ -72,12 +98,7 @@ class ModelWorker:
         # Parse args
         self.tp_size = server_args.tp_size
         self.dp_size = server_args.dp_size
-        self._pd_fuse_sample = (
-            server_args.pd_disaggregation == "pathways"
-            and os.getenv("SGLANG_PD_FUSE_SAMPLE") == "1"
-            # AOT artifacts contain the model forward; sampling remains separate.
-            and not server_args.aot_model_dir
-        )
+        self._pd_fuse_sample = fused_decode_sample_enabled(server_args, is_draft_worker)
         from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
@@ -161,9 +182,11 @@ class ModelWorker:
 
         # Same-shape dummy for callers without a real future map (precompile,
         # non-overlap) so the fused jit variant matches the overlap-thread shape.
+        # Size must equal ModelWorkerClient.future_map_size (req pool + 2) or
+        # every decode bucket recompiles on first live use.
         if self._pd_fuse_sample:
             self._pd_dummy_future_map = jax.device_put(
-                jnp.zeros((self.max_running_requests * 5,), dtype=jnp.int32),
+                jnp.zeros((self.model_runner.req_to_token_pool.size + 2,), dtype=jnp.int32),
                 NamedSharding(self.mesh, P(None)),
             )
 
