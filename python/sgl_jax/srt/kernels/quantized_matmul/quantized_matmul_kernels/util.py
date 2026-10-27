@@ -58,6 +58,18 @@ def next_multiple(x, multiple):
     return ((x + multiple - 1) // multiple) * multiple
 
 
+def fit_block(dim: int, block: int, align: int) -> int:
+    """Block size that avoids padding ``dim``: ``block`` if it divides ``dim``, else the largest multiple of
+    ``align`` below ``block`` that divides ``dim``, else ``block`` (pad). Padding a weight operand is an HBM copy of
+    the whole weight inside every step (GLM-5.3 v6e-8 decode: 17 x 44 us of pad.rhs_ref per step)."""
+    if dim % block == 0 or dim < align:
+        return block
+    for b in range(block - block % align, align - 1, -align):
+        if dim % b == 0:
+            return b
+    return block
+
+
 def get_kernel_name(tuned_value: TunedValue):
     batch_block_size = tuned_value.batch_block_size
     out_block_size = tuned_value.out_block_size

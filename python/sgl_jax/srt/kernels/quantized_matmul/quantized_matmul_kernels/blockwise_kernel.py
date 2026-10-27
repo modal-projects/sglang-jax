@@ -76,6 +76,10 @@ def quantized_matmul_kernel(
     out_block_size = tuned_value.out_block_size
     in_block_size = tuned_value.in_block_size
     n_lane_multiplier = tuned_value.n_lane_multiplier
+    # Prefer a divisor block over padding the weight every call (out: whole MXU tiles; in: whole quant blocks).
+    if block_size != orig_n_in:
+        out_block_size = util.fit_block(orig_n_out, out_block_size, MXU_SIZE * n_lane_multiplier)
+        in_block_size = util.fit_block(orig_n_in, in_block_size, block_size)
     # The num_blocks should become 1 in case of channelwise.
     block_size = tuned_value.in_block_size if block_size == orig_n_in else block_size
 
