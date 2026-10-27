@@ -953,7 +953,12 @@ class ModelRunnerKVCacheMixin:
                 )
                 self.max_total_num_tokens += spec_headroom
                 self.server_args.max_num_reqs = max_num_reqs
-                self.server_args.draft_runner_cache_size = self.max_total_num_tokens
+                # The draft shares the target's allocator, so its pool must match the target's
+                # (capped) size; uncapped it sizes from the profiled budget (CPU: 61M tokens -> OOM).
+                draft_tokens = self.max_total_num_tokens
+                if max_total_tokens is not None and max_total_tokens > 0:
+                    draft_tokens = min(draft_tokens, max_total_tokens)
+                self.server_args.draft_runner_cache_size = draft_tokens
 
         # 6. Apply constraints (CI, user cap, page align, dp).
         self.max_total_num_tokens = self._apply_token_constraints(
