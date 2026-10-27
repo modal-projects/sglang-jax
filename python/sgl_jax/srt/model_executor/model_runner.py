@@ -822,6 +822,12 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             return False
 
         backend = self.server_args.attention_backend
+        if backend == "dsa_sparse" and not self.use_mla_backend:
+            # dsa_sparse is the target's (MLA + indexer) backend; a non-MLA model under it -- e.g. the
+            # DFlash/DFlash2 draft of a GLM-5.x target -- runs plain paged attention.
+            logger.info("attention backend dsa_sparse -> fa for a non-MLA model (draft=%s)",
+                        getattr(self, "is_draft_worker", False))
+            backend = "fa"
         from sgl_jax.srt.layers.attention.msa_backend import msa_sparse_config
 
         if msa_sparse_config(self.model_config) is not None and backend != "fa":
