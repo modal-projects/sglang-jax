@@ -23,6 +23,7 @@ there for the math and its provenance.
 from __future__ import annotations
 
 import logging
+import os
 from functools import partial
 
 import jax
@@ -98,6 +99,11 @@ class Glm5NextHC(nnx.Module):
         self.hc_iters = hc_iters
         self.hc_eps = hc_eps
         self.eps = rms_eps
+        self.mesh = mesh
+        # Opt-in Pallas mHC (kernels/mhc, DeepSeek-V4 operators; same math): one kernel for
+        # RMS + gate projection + Sinkhorn + collapse, one for the write-back, instead of ~40
+        # tiny XLA fusions per sublayer (~0.8 ms of a 10 ms v6e-8 decode step).
+        self.use_kernel = os.environ.get("SGLJAX_GLM5_MHC_KERNEL", "0") == "1"
         n = (2 + hc_mult) * hc_mult
         sh = NamedSharding(mesh, P(None, None))
         sh1 = NamedSharding(mesh, P(None))
@@ -133,7 +139,39 @@ class Glm5NextHC(nnx.Module):
         collapsed = jnp.einsum("...h,...hd->...d", pre, streams_htd).astype(streams.dtype)
         return post, comb, collapsed
 
+    def _replicated(self, fn, *args):
+        """Run a Pallas mHC op per device on replicated activations (the hidden streams are
+        replicated across the model mesh between sublayers)."""
+        specs = tuple(P() for _ in args)
+        return jax.shard_map(
+            fn, mesh=self.mesh, in_specs=specs, out_specs=P(), check_vma=False
+        )(*args)
+
+    def _pre_kernel(self, streams: jax.Array):
+        from sgl_jax.srt.kernels.mhc import mhc_pre_fused
+
+        hc = self.hc
+        lead = streams.shape[:-1]
+        d = streams.shape[-1] // hc
+
+        def run(x, fn_t, scale, base):
+            return mhc_pre_fused(
+                x, fn_t, scale, base, hc_mult=hc, sinkhorn_iters=self.hc_iters,
+                norm_eps=self.eps, hc_eps=self.hc_eps,
+            )
+
+        collapsed, post, comb = self._replicated(
+            run,
+            streams.reshape(*lead, hc, d),
+            self.fn.value.astype(jnp.float32).T,
+            self.scale.value.astype(jnp.float32),
+            self.base.value.astype(jnp.float32),
+        )
+        return collapsed, (post, comb)
+
     def pre(self, streams: jax.Array):
+        if self.use_kernel:
+            return self._pre_kernel(streams)
         post, comb, collapsed = self._mix(streams)
         return collapsed, (post, comb)
 
@@ -143,6 +181,14 @@ class Glm5NextHC(nnx.Module):
         hc = self.hc
         lead = streams.shape[:-1]
         d = streams.shape[-1] // hc
+        if self.use_kernel:
+            from sgl_jax.srt.kernels.mhc import mhc_post_fused
+
+            out = self._replicated(
+                lambda y_, r_, p_, c_: mhc_post_fused(y_, r_, p_, c_),
+                y.astype(streams.dtype), streams.reshape(*lead, hc, d), post, comb,
+            )
+            return out.reshape(*lead, hc * d)
         streams_htd = streams.reshape(*lead, hc, d).astype(jnp.float32)
         y = y.astype(jnp.float32)
         out = post[..., None] * y[..., None, :] + jnp.einsum(
