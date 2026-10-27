@@ -44,8 +44,14 @@ from sgl_jax.srt.models.glm5_moe import (
     Glm5Attention,
     Glm5ForCausalLM,
     Glm5MLP,
+    fused_moe_reduce_supported,
     fused_v2_moe,
     moe_router,
+)
+from sgl_jax.srt.kernels.collectives.oneshot_allreduce import (
+    defer_reduce,
+    fused_all_reduce,
+    fused_moe_enabled,
 )
 from sgl_jax.srt.layers.moe import EPMoE
 from sgl_jax.srt.models.kimi_linear import KimiDeltaAttention, kda_attention_mappings
@@ -200,6 +206,7 @@ class Glm5NextHC(nnx.Module):
 class Glm5NextDecoderLayer(nnx.Module):
     def __init__(self, config: Glm5NextConfig, mesh, layer_id: int = 0, dtype=jnp.bfloat16):
         self.layer_id = layer_id
+        self.mesh = mesh
         self.is_kda = config.is_kda_layer(layer_id)
         self.swiglu_limit = config.swiglu_limit
 
@@ -356,9 +363,22 @@ class Glm5NextDecoderLayer(nnx.Module):
                 router_logits, self.moe_gate.bias.value, dispatch_info=dispatch_info
             )
             if self.moe_backend == MoEBackend.EPMOE:
-                mlp_out = self.mlp(h, topk_weights, topk_ids)
-                if self.shared_experts is not None:
-                    mlp_out = mlp_out + self.shared_experts(h)
+                # Opt-in (SGLANG_JAX_ONESHOT_AR_MIN_BYTES>0, SITES has "fused"): shared down_proj
+                # and the EPMoE combine return per-device partials, reduced with one all-reduce
+                # (the Pallas one-shot kernel inside its byte window), as glm5_moe does.
+                if (
+                    self.shared_experts is not None
+                    and fused_moe_enabled(h)
+                    and fused_moe_reduce_supported(self.mesh, self.shared_experts, False)
+                ):
+                    with defer_reduce():
+                        shared = self.shared_experts(h)
+                        routed = self.mlp(h, topk_weights, topk_ids)
+                    mlp_out = fused_all_reduce(routed + shared, self.mesh)
+                else:
+                    mlp_out = self.mlp(h, topk_weights, topk_ids)
+                    if self.shared_experts is not None:
+                        mlp_out = mlp_out + self.shared_experts(h)
             else:
                 # SwiGLU clamp on the routed and (in-kernel) shared experts.
                 limit = self.swiglu_limit
