@@ -68,10 +68,17 @@ def gmm(
         # packed FP4 is v2-only and may carry row-layout [G, K/32, N] scales
         rhs_fp4_packed or is_supported_by_gmm_v2(rhs_scale, maybe_quantize_lhs=maybe_quantize_lhs)
     )
-    if rhs_fp4_packed and interpret:
-        # CPU (tests): the packed-FP4 kernel in Pallas TPU interpret mode.
-        return _gmm_v2_fp4_interpret(
-            lhs, rhs, group_sizes, rhs_scale, group_offset, preferred_element_type, zero_initialize
+    if interpret and (rhs_fp4_packed or rhs.dtype == jnp.int4):
+        # CPU (tests): packed FP4 / int4 (no gmm v1 support) via gmm_v2 in Pallas interpret mode.
+        return _gmm_v2_interpret(
+            lhs,
+            rhs,
+            group_sizes,
+            rhs_scale,
+            group_offset,
+            preferred_element_type,
+            rhs_fp4_packed=rhs_fp4_packed,
+            maybe_quantize_lhs=maybe_quantize_lhs,
         )
     if (rhs_e2m1_codes or rhs_fp4_packed) and not use_gmm_v2:
         raise NotImplementedError("E2M1-coded (MXFP4) weights require the GMM v2 TPU kernel")
@@ -139,10 +146,18 @@ def gmm(
     return out
 
 
-def _gmm_v2_fp4_interpret(
-    lhs, rhs, group_sizes, rhs_scale, group_offset, preferred_element_type, zero_initialize
+def _gmm_v2_interpret(
+    lhs,
+    rhs,
+    group_sizes,
+    rhs_scale,
+    group_offset,
+    preferred_element_type,
+    *,
+    rhs_fp4_packed,
+    maybe_quantize_lhs,
 ):
-    """Packed-FP4 gmm_v2 in Pallas TPU interpret mode (CPU tests; slow).
+    """gmm_v2 in Pallas TPU interpret mode (CPU tests; slow).
 
     The interpreter cannot run the kernel's zero-init DMAs, so rows outside this shard's groups
     are zeroed here, which is exactly what zero_initialize=True produces on TPU.
@@ -164,10 +179,10 @@ def _gmm_v2_fp4_interpret(
         rhs_scale=rhs_scale,
         group_offset=group_offset,
         preferred_element_type=preferred_element_type,
-        maybe_quantize_lhs=False,
+        maybe_quantize_lhs=maybe_quantize_lhs and not rhs_fp4_packed,
         zero_initialize=False,
         acc_dtype=jnp.float32,
-        rhs_fp4_packed=True,
+        rhs_fp4_packed=rhs_fp4_packed,
         # disable_bounds_checks=True on TPU: the bounded-slice lhs pipeline may read past a VMEM
         # buffer for rows it then masks; mirror that instead of raising.
         interpret=pltpu.InterpretParams(uninitialized_memory="zero", out_of_bounds_reads="uninitialized"),
@@ -178,5 +193,4 @@ def _gmm_v2_fp4_interpret(
     end = start + jnp.sum(jnp.where(local, group_sizes, 0))
     rows = jnp.arange(out.shape[0])[:, None]
     out = jnp.where((rows >= start) & (rows < end), out, jnp.zeros((), out.dtype))
-    del zero_initialize  # always zero-filled (see docstring)
     return out[:m]
