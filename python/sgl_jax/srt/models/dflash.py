@@ -382,6 +382,8 @@ class DFlashDecoderLayer(nnx.Module):
         dtype: jnp.dtype = jnp.bfloat16,
         options: DFlashModelOptions | None = None,
     ):
+        # Read by the hybrid (SWA + full) KV pool sizing in ModelRunner.set_num_token_hybrid.
+        self.layer_id = layer_id
         hidden_size = int(config.hidden_size)
         rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-6))
         if options is not None and options.has_conv:
