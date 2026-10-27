@@ -1254,7 +1254,11 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         self.full_max_total_num_tokens -= self.full_max_total_num_tokens % alignment
         self.swa_max_total_num_tokens -= self.swa_max_total_num_tokens % alignment
 
-        self.max_total_num_tokens = self.full_max_total_num_tokens
+        # An all-SWA model (e.g. the GLM-5.3 DFlash2 draft: 6 sliding-window layers) has no full pool;
+        # its token budget is the SWA pool.
+        self.max_total_num_tokens = (
+            self.full_max_total_num_tokens if full_layers_num else self.swa_max_total_num_tokens
+        )
 
         logger.info(
             "Use Sliding window memory pool. full_layer_tokens=%s, swa_layer_tokens=%s",
