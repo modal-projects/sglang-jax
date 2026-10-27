@@ -711,5 +711,11 @@ class Glm5NextForConditionalGeneration(nnx.Module):
     def get_input_embeddings(self):
         return self.model.embed_tokens
 
+    def get_embed_and_head(self):
+        """(embed [vocab, hidden], lm_head [vocab, hidden]) for the DFlash draft worker."""
+        embed = self.model.embed_tokens.embedding.value
+        head = embed if self.config.tie_word_embeddings else self.lm_head.embedding.value
+        return embed, head
+
 
 EntryClass = [Glm5NextForConditionalGeneration]
