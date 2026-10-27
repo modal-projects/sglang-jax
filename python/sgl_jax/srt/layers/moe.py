@@ -2,6 +2,7 @@
 
 import logging
 import math
+import os
 from functools import partial
 
 import jax
@@ -307,8 +308,7 @@ class EPMoE(nnx.Module):
         if self.fused_gate_up or self.wi_1 is None:
             return False
         if self.fp4_packed:
-            # packed-FP4 experts keep the two-call path (no fused-GLU packed-FP4 kernel)
-            return False
+            return self._fuse_gate_up_fp4_packed()
         moe_tp = int(self.moe_mesh.shape.get("tensor", 1))
         if moe_tp != 1:
             return False
@@ -355,6 +355,29 @@ class EPMoE(nnx.Module):
                 "%d-column chunks, GEMM1 emits silu(gate)*up from the gmm_v2 epilogue",
                 glu_chunk,
             )
+        return True
+
+    def _fuse_gate_up_fp4_packed(self) -> bool:
+        """Packed-FP4 gate/up -> one [E, K/8, 2N] grouped matmul (opt-in:
+        SGLJAX_MXFP4_FUSED_GATE_UP=1). The packing runs along K only, so whole output columns
+        concatenate unchanged; the [E, K/32, N] scales concatenate the same way. No GLU epilogue
+        (GLM-5.3's silu_clamp is applied by XLA on the split halves)."""
+        if os.environ.get("SGLJAX_MXFP4_FUSED_GATE_UP", "0") != "1":
+            return False
+        if int(self.moe_mesh.shape.get("tensor", 1)) != 1:
+            return False
+        w0, w1 = self.wi_0.value, self.wi_1.value
+        with jax.set_mesh(self.moe_mesh), jax.sharding.use_abstract_mesh(self.updated_mesh):
+            s0 = self._normalize_scale_for_gmm(self.wi_0_scale.value, w0, scale_name="wi_0_scale")
+            s1 = self._normalize_scale_for_gmm(self.wi_1_scale.value, w1, scale_name="wi_1_scale")
+            spec = P("expert", None, "tensor")
+            self.wi_0 = nnx.Param(jnp.concatenate([w0, w1], axis=-1), out_sharding=spec)
+            self.wi_0_scale = nnx.Param(jnp.concatenate([s0, s1], axis=-1), out_sharding=spec)
+            self.wi_1 = None
+            self.wi_1_scale = None
+        self.fused_gate_up = True
+        self.glu_chunk = 0
+        logger.info("EPMoE layer %s: packed-FP4 gate/up fused into one GMM", self.layer_id)
         return True
 
     def _get_wo_scale_sharding(

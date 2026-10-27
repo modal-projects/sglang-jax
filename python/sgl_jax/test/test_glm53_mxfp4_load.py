@@ -41,6 +41,11 @@ def test_glm53_mxfp4_mini_epmoe_forward():
     _run("forward", 1, "MXFP4_FORWARD_OK")
 
 
+@pytest.mark.skipif(not MINI, reason="set MXFP4_MINI to a mini Quark MXFP4 checkpoint")
+def test_glm53_mxfp4_mini_epmoe_forward_fused_gate_up():
+    _run("forward_fused", 1, "MXFP4_FORWARD_OK")
+
+
 def _main(mini: str) -> None:
     import importlib
     import re
@@ -183,7 +188,7 @@ def _main(mini: str) -> None:
     print("MXFP4_LOAD_OK")
 
 
-def _forward(mini: str) -> None:
+def _forward(mini: str, fused: bool = False) -> None:
     """Routed experts of the mini checkpoint through EPMoE on one CPU device: weights placed by the
     loader's MXFP4 recipe, packed-FP4 gmm_v2 in interpret mode, vs a dense f64 reference. (One
     device: the Pallas interpreter's host callbacks deadlock under multi-device CPU execution; EP8
@@ -242,6 +247,11 @@ def _forward(mini: str) -> None:
         getattr(moe, name + "_scale").set_value(s)
         deq[proj] = [mxfp4.dequantize_mxfp4(inputs[2 * e], inputs[2 * e + 1]).T.astype(np.float64)
                      for e in range(E)]
+    if fused:
+        os.environ["SGLJAX_MXFP4_FUSED_GATE_UP"] = "1"
+        with jax.set_mesh(mesh):
+            assert moe.fuse_gate_up(), "packed-FP4 gate/up fusion did not apply"
+        assert moe.wi_1 is None and moe.wi_0.get_value().shape == (E, Hd // 8, 2 * Id)
     rng = np.random.default_rng(0)
     T = 8
     x = (rng.standard_normal((T, Hd)) * 0.5).astype(ml_dtypes.bfloat16)
@@ -262,7 +272,7 @@ def _forward(mini: str) -> None:
             ref[t] += wts[t, j] * (h @ deq["down_proj"][e])
     err = np.abs(out - ref)
     rel = err.max() / np.abs(ref).max()
-    print(f"EPMOE_FORWARD tokens={T} topk={K} experts={E} max_abs={err.max():.3e} "
+    print(f"EPMOE_FORWARD fused_gate_up={fused} tokens={T} topk={K} experts={E} max_abs={err.max():.3e} "
           f"rel(of max)={rel:.3e} ref_max={np.abs(ref).max():.3e}")
     # bf16 GEMM1 outputs / bf16 GLU / bf16 output rounding only (weights exact)
     assert rel < 2e-2, rel
@@ -270,4 +280,5 @@ def _forward(mini: str) -> None:
 
 
 if __name__ == "__main__":
-    {"load": _main, "forward": _forward}[sys.argv[2] if len(sys.argv) > 2 else "load"](sys.argv[1])
+    modes = {"load": _main, "forward": _forward, "forward_fused": lambda p: _forward(p, fused=True)}
+    modes[sys.argv[2] if len(sys.argv) > 2 else "load"](sys.argv[1])

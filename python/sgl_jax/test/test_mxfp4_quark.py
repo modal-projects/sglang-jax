@@ -260,3 +260,21 @@ def test_gmm_v2_fp4_packed_matches_dequantized_reference(cpu_v6e, proj, rows_per
     )
     # Exact weights and exact bf16 activations: only f32 accumulation order differs.
     assert rel < 1e-5, rel
+
+
+def test_fp4_path_selection_knobs(monkeypatch):
+    gmm_v2 = importlib.import_module("sgl_jax.srt.kernels.gmm.megablox_gmm_kernel.gmm_v2")
+    # EP8 at M=1024 tokens: 8192 rows over all 288 experts, 36 local groups
+    d = gmm_v2.Dimensions(size_m=8192, size_k=4096, size_n=2048, size_group=36,
+                          size_lhs_group=288, size_lhs_sublane=16)
+    for k in ("SGLJAX_FP4_PATH", "SGLJAX_FP4_FULLK_MIN_ROWS", "SGLJAX_FP4_FULLK_BASIS"):
+        monkeypatch.delenv(k, raising=False)
+    assert gmm_v2.fp4_packed_use_full_k(d)  # legacy: 8192 >= 96 * 36
+    monkeypatch.setenv("SGLJAX_FP4_FULLK_BASIS", "global")
+    assert not gmm_v2.fp4_packed_use_full_k(d)  # 8192 / 288 = 28 rows/expert < 96
+    monkeypatch.setenv("SGLJAX_FP4_FULLK_MIN_ROWS", "16")
+    assert gmm_v2.fp4_packed_use_full_k(d)
+    monkeypatch.setenv("SGLJAX_FP4_PATH", "decode")
+    assert not gmm_v2.fp4_packed_use_full_k(d)
+    monkeypatch.setenv("SGLJAX_FP4_PATH", "fullk")
+    assert gmm_v2.fp4_packed_use_full_k(d)

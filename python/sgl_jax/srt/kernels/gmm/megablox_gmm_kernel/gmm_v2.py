@@ -83,6 +83,30 @@ FP4_PACKED_MAX_TILE_M = 32
 # (v5e, 16 experts: 1024 rows 1123 vs 1263 us, 2048 rows 2196 vs 1264 us, 8192 rows 8679 vs 2479 us).
 FP4_PACKED_FULL_K_MIN_ROWS_PER_GROUP = 96
 FP4_PACKED_FULL_K_TILE_M = 256
+
+
+def fp4_packed_use_full_k(dims) -> bool:
+    """Trace-time choice between the packed-FP4 K32 block-dot (decode) and full-K (prefill) paths.
+
+    Env knobs (read at trace time, so a sweep needs jax.clear_caches() between settings):
+      SGLJAX_FP4_PATH            auto (default) | decode | fullk  (force one path)
+      SGLJAX_FP4_FULLK_MIN_ROWS  rows-per-expert cutoff, default FP4_PACKED_FULL_K_MIN_ROWS_PER_GROUP
+      SGLJAX_FP4_FULLK_BASIS     local (default; dsv4-fp4 rule: size_m / rhs groups -- under EP the
+                                 lhs holds every rank's rows, so this overstates rows per local
+                                 expert by ep_size) | global (size_m / lhs groups: the average rows
+                                 per expert, independent of the EP size)
+    """
+    path = os.environ.get("SGLJAX_FP4_PATH", "auto")
+    if path not in ("auto", "decode", "fullk"):
+        raise ValueError(f"SGLJAX_FP4_PATH must be auto, decode or fullk, got {path!r}")
+    if path != "auto":
+        return path == "fullk"
+    cutoff = float(os.environ.get("SGLJAX_FP4_FULLK_MIN_ROWS", FP4_PACKED_FULL_K_MIN_ROWS_PER_GROUP))
+    basis = os.environ.get("SGLJAX_FP4_FULLK_BASIS", "local")
+    if basis not in ("local", "global"):
+        raise ValueError(f"SGLJAX_FP4_FULLK_BASIS must be local or global, got {basis!r}")
+    groups = dims.size_group if basis == "local" else dims.size_lhs_group
+    return dims.size_m >= cutoff * groups
 FP4_PACKED_FULL_K_MAX_TILE_N = 512
 
 
@@ -1171,7 +1195,7 @@ def make_gmm_configs(
         lhs_q_dtype = lhs_q_dtype if lhs_q_dtype is not None else lhs.dtype
         rhs_tile_dtype = jnp.int4 if rhs_fp4_packed else rhs.dtype
         tiles = tile_info(lhs_q_dtype, rhs_tile_dtype, dims, vmem_limit_bytes)
-        if rhs_fp4_packed and dims.size_m >= FP4_PACKED_FULL_K_MIN_ROWS_PER_GROUP * dims.size_group:
+        if rhs_fp4_packed and fp4_packed_use_full_k(dims):
             # Prefill: full-K scaled-weight path (tile_m > FP4_PACKED_MAX_TILE_M selects it).
             tiles = dataclasses.replace(
                 tiles,

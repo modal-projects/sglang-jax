@@ -720,12 +720,19 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                     )
         # Fuse each EPMoE's gate/up expert weights into one [E, K, 2N] grouped matmul
         # (75 fewer gmm calls per step on GLM-5.2). Must run before nnx.split / jit.
-        if envs.SGLANG_JAX_EPMOE_FUSED_GATE_UP.get():
+        # Packed-FP4 (MXFP4) experts opt in separately: SGLJAX_MXFP4_FUSED_GATE_UP=1.
+        fuse_all = envs.SGLANG_JAX_EPMOE_FUSED_GATE_UP.get()
+        fuse_fp4 = os.environ.get("SGLJAX_MXFP4_FUSED_GATE_UP", "0") == "1"
+        if fuse_all or fuse_fp4:
             from sgl_jax.srt.layers.moe import EPMoE
 
             fused = 0
             for _path, node in nnx.iter_graph(self.model):
-                if isinstance(node, EPMoE) and node.fuse_gate_up():
+                if (
+                    isinstance(node, EPMoE)
+                    and (fuse_all or getattr(node, "fp4_packed", False))
+                    and node.fuse_gate_up()
+                ):
                     fused += 1
             logger.info("EPMoE fused gate/up expert weights on %d layers", fused)
 
