@@ -7,6 +7,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from jax.sharding import Mesh
+from jax.sharding import PartitionSpec as P
 
 import sgl_jax.srt.kernels.mhc.mhc as _mhc
 from sgl_jax.srt.models.glm5_next import Glm5NextHC
@@ -16,10 +17,17 @@ from sgl_jax.srt.models.glm5_next import Glm5NextHC
     jax.devices()[0].platform == "cpu" and os.environ.get("PALLAS_INTERPRET") != "1",
     reason="needs TPU or PALLAS_INTERPRET=1",
 )
-def test_glm5_next_mhc_kernel_matches_reference(monkeypatch):
+@pytest.mark.parametrize("dp", [1, 4])
+def test_glm5_next_mhc_kernel_matches_reference(monkeypatch, dp):
     if jax.devices()[0].platform == "cpu":
         monkeypatch.setattr(_mhc, "_device_kind", lambda: "TPU v6e")
-    mesh = Mesh(np.array(jax.devices()).reshape(1, -1), ("data", "tensor"))
+    if len(jax.devices()) % dp:
+        pytest.skip("needs a device count divisible by dp")
+    mesh = Mesh(
+        np.array(jax.devices()).reshape(dp, -1),
+        ("data", "tensor"),
+        axis_types=(jax.sharding.AxisType.Explicit,) * 2,
+    )
     D, HC = 4096, 4
     with jax.set_mesh(mesh):
         hc = Glm5NextHC(D, HC, 20, 1e-6, 1e-6, mesh, jnp.bfloat16)
@@ -28,9 +36,12 @@ def test_glm5_next_mhc_kernel_matches_reference(monkeypatch):
         hc.base.value = jax.random.normal(k[1], hc.base.value.shape) * 0.5
         hc.scale.value = jnp.array([0.7, 1.3, 2.0], jnp.float32)
         worst = 0.0
-        for T in (1, 8, 33):
+        for T in ((1, 8, 33) if dp == 1 else (4, 32)):  # DP: tokens split over data
             s = jax.random.normal(jax.random.fold_in(k[2], T), (T, HC * D), jnp.float32).astype(jnp.bfloat16)
             y = jax.random.normal(jax.random.fold_in(k[3], T), (T, D), jnp.float32).astype(jnp.bfloat16)
+            if dp > 1:  # DP attention: hidden streams arrive sharded on tokens
+                s = jax.sharding.reshard(s, P("data", None))
+                y = jax.sharding.reshard(y, P("data", None))
             outs = {}
             for flag in (False, True):
                 hc.use_kernel = flag

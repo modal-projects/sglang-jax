@@ -145,12 +145,24 @@ class Glm5NextHC(nnx.Module):
         collapsed = jnp.einsum("...h,...hd->...d", pre, streams_htd).astype(streams.dtype)
         return post, comb, collapsed
 
-    def _replicated(self, fn, *args):
-        """Run a Pallas mHC op per device on replicated activations (the hidden streams are
-        replicated across the model mesh between sublayers)."""
-        specs = tuple(P() for _ in args)
+    def _per_device(self, fn, args, n_token_args, out_ndims):
+        """Run a Pallas mHC op per device. The first ``n_token_args`` operands (and every output)
+        carry tokens on axis 0 and keep the caller's token sharding (replicated under attention
+        TP, ``data``-sharded under DP attention); the rest (gate weights) are replicated."""
+        try:
+            lead = jax.typeof(args[0]).sharding.spec
+            lead = lead[0] if len(lead) else None
+        except Exception:  # noqa: BLE001
+            lead = None
+
+        def tok(x):
+            return P(lead, *([None] * (x.ndim - 1)))
+
+        in_specs = tuple(tok(a) if i < n_token_args else P() for i, a in enumerate(args))
+        out_specs = tuple(P(lead, *([None] * (n - 1))) for n in out_ndims)
+        out_specs = out_specs[0] if len(out_specs) == 1 else out_specs
         return jax.shard_map(
-            fn, mesh=self.mesh, in_specs=specs, out_specs=P(), check_vma=False
+            fn, mesh=self.mesh, in_specs=in_specs, out_specs=out_specs, check_vma=False
         )(*args)
 
     def _pre_kernel(self, streams: jax.Array):
@@ -166,12 +178,16 @@ class Glm5NextHC(nnx.Module):
                 norm_eps=self.eps, hc_eps=self.hc_eps,
             )
 
-        collapsed, post, comb = self._replicated(
+        collapsed, post, comb = self._per_device(
             run,
-            streams.reshape(*lead, hc, d),
-            self.fn.value.astype(jnp.float32).T,
-            self.scale.value.astype(jnp.float32),
-            self.base.value.astype(jnp.float32),
+            (
+                streams.reshape(*lead, hc, d),
+                self.fn.value.astype(jnp.float32).T,
+                self.scale.value.astype(jnp.float32),
+                self.base.value.astype(jnp.float32),
+            ),
+            1,
+            (len(lead) + 1, len(lead) + 1, len(lead) + 2),
         )
         return collapsed, (post, comb)
 
@@ -190,9 +206,11 @@ class Glm5NextHC(nnx.Module):
         if self.use_kernel:
             from sgl_jax.srt.kernels.mhc import mhc_post_fused
 
-            out = self._replicated(
+            out = self._per_device(
                 lambda y_, r_, p_, c_: mhc_post_fused(y_, r_, p_, c_),
-                y.astype(streams.dtype), streams.reshape(*lead, hc, d), post, comb,
+                (y.astype(streams.dtype), streams.reshape(*lead, hc, d), post, comb),
+                4,
+                (len(lead) + 2,),
             )
             return out.reshape(*lead, hc * d)
         streams_htd = streams.reshape(*lead, hc, d).astype(jnp.float32)
