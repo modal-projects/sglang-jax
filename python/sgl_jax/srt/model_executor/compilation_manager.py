@@ -407,6 +407,35 @@ class CompilationManager:
         return options
 
     @staticmethod
+    def _log_memory(lowered, compiled):
+        """One line per compiled program: XLA's per-device temp/arg/output bytes. Sizes the HBM
+        headroom (1 - mem_fraction_static) each precompile bucket needs."""
+        try:
+            m = compiled.memory_analysis()
+            if m is None:
+                return
+            gb = 1 << 30
+            import jax
+
+            dims = sorted(
+                {
+                    a.shape[0]
+                    for a in jax.tree_util.tree_leaves(lowered.args_info)
+                    if len(getattr(a, "shape", ())) == 1
+                }
+            )[-4:]
+            logger.info(
+                "compile memory: 1-D arg dims %s temp=%.2fG arg=%.2fG out=%.2fG alias=%.2fG",
+                dims,
+                m.temp_size_in_bytes / gb,
+                m.argument_size_in_bytes / gb,
+                m.output_size_in_bytes / gb,
+                m.alias_size_in_bytes / gb,
+            )
+        except Exception as e:  # diagnostics only
+            logger.debug("memory_analysis unavailable: %s", e)
+
+    @staticmethod
     def get_executable(lowered, mesh=None, compiler_options=None, *, store=None, output=None):
         """Acquire an executable for a lowering, optionally persisting it.
 
@@ -418,6 +447,7 @@ class CompilationManager:
                 raise ValueError("Choose executable loading or export, not both")
             return store.load(lowered, compiler_options)
         compiled = lowered.compile(compiler_options=compiler_options or None)
+        CompilationManager._log_memory(lowered, compiled)
         if output is not None:
             from sgl_jax.srt.model_executor.aot_executable import save_executable
 
