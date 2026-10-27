@@ -60,6 +60,7 @@ def prepare_absorbed_mla(module, loader, mappings, prefix):
     mappings[weight] = WeightSpec(
         [prefix + ".w_uk", prefix + ".w_uv"],
         sources=tuple(sources),
+        sharding=(None, "tensor", None),  # = the recipe's output layout (dummy/AOT loads use it)
         recipe=partial(
             _absorb_mla,
             mesh=module.mesh,

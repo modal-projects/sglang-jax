@@ -111,6 +111,8 @@ def load_config(options, model_path, *, is_draft=False):
     model_config.ep_size = options.ep_size
     model_config.hf_config.ep_size = options.ep_size
     model_config.hf_config.moe_backend = model_config.moe_backend.value
+    # Serving sets this from --attention-backend in ModelConfig (GLM-5.x DSA models require it).
+    model_config.hf_config.use_dsa_sparse = options.attention_backend == "dsa_sparse"
     attention_tp = options.tp_size // options.dp_size
     model_config.validate_tensor_parallel_config(attention_tp)
     model_config.configure_for_tensor_parallel(attention_tp)

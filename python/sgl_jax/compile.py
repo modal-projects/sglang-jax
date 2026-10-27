@@ -41,7 +41,7 @@ def parse_args():
         "--dp-size", type=int, default=1, help="Attention DP; attention TP=tp_size/dp_size"
     )
     parser.add_argument("--ep-size", type=int, default=1)
-    parser.add_argument("--attention-backend", choices=("native", "fa"), default="native")
+    parser.add_argument("--attention-backend", choices=("native", "fa", "dsa_sparse"), default="native")
     parser.add_argument("--moe-backend", choices=("epmoe", "fused_v2"))
     quantization = parser.add_mutually_exclusive_group()
     quantization.add_argument(

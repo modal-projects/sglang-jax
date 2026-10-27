@@ -141,7 +141,9 @@ def export(options):
                 "input_tokens_per_dp": workload.input_token_count // workload.dp_size,
                 "model_class": config.architectures[0] if config.architectures else None,
                 "model_type": config.model_type,
-                "num_hidden_layers": config.num_hidden_layers,
+                "num_hidden_layers": getattr(
+                    config, "num_hidden_layers", getattr(config.get_text_config(), "num_hidden_layers", None)
+                ),
                 "attention_backend": options.attention_backend,
                 "moe_backend": options.moe_backend,
                 "attention_tp_size": options.tp_size // options.dp_size,
