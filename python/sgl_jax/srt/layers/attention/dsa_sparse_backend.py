@@ -521,8 +521,8 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                 is_full, a[6], a[7], a[8], a[5], dpa, md, compute_topk=False, compute_pages=False
             )
             # -1 placeholders in the token placement of the sparse branch's top-k
-            topk = None if shapes[3] is None else _like_rows(a[2], shapes[3])
-            pages = None if shapes[4] is None else _like_rows(a[2], shapes[4])
+            topk = None if shapes[3] is None else _placeholder_as(shapes[3])
+            pages = None if shapes[4] is None else _placeholder_as(shapes[4])
             return o.astype(shapes[0].dtype), kv, idx, topk, pages
 
         short = jnp.max(md.seq_lens) <= self.index_topk
@@ -1629,13 +1629,14 @@ def _pad_topk_pages(topk_pages: jax.Array, width: int) -> jax.Array:
     return jnp.pad(topk_pages, ((0, 0), (0, width - k)), constant_values=-1)
 
 
-def _like_rows(rows: jax.Array, sd) -> jax.Array:
-    """All -1 array of ``sd``'s shape/dtype, built from the data-sharded ``rows`` [T, ...] so
-    it carries the token placement (a fresh jnp.full would be replicated)."""
-    if sd.shape[0] != rows.shape[0]:
-        return jnp.full(sd.shape, -1, sd.dtype)
-    base = jnp.zeros_like(rows[:, :1], dtype=sd.dtype) - 1  # [T, 1]
-    return jnp.broadcast_to(base, (rows.shape[0],) + tuple(sd.shape[1:]))
+def _placeholder_as(sd) -> jax.Array:
+    """All -1 array with ``sd``'s shape, dtype and (explicit-mesh) sharding, so both lax.cond
+    branches have identical output types."""
+    x = jnp.full(sd.shape, -1, sd.dtype)
+    sharding = getattr(sd, "sharding", None)
+    if sharding is not None:
+        x = jax.sharding.reshard(x, sharding)
+    return x
 
 
 def _placeholder_topk_like(topk_pages: jax.Array) -> jax.Array:
