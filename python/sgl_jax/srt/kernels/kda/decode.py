@@ -115,44 +115,58 @@ def _kda_decode_kernel(
     head_k: int,
     head_v: int,
     column_mode: str,
+    reqs: int = 1,
 ):
+    """One grid step = ``reqs`` requests x ``hb_size`` heads (scratch [2, reqs*hb, K, V]; request
+    r of the step uses rows r*hb .. r*hb+hb-1). reqs > 1 amortizes the per-step overhead when a
+    chip holds few heads (TP8: 8 heads = 256 KiB of bf16 state per request)."""
     del pool_in_ref
     K, V = head_k, head_v
+    R = reqs
     i = pl.program_id(0)
     slot = i % 2
 
     def coords(j):
-        return j // nhb, (j % nhb) * hb_size
+        return (j // nhb) * R, (j % nhb) * hb_size
 
-    def read_copy(j, s, src):
+    def read_copy(j, s, r, src):
         _, h0 = coords(j)
         return pltpu.make_async_copy(
-            pool_ref.at[src, pl.ds(h0, hb_size)], in_buf.at[s], sem_in.at[s]
+            pool_ref.at[src, pl.ds(h0, hb_size)],
+            in_buf.at[s, pl.ds(r * hb_size, hb_size)],
+            sem_in.at[s, r],
         )
 
-    def write_copy(j, s, dst, sem):
+    def write_copy(j, s, r, dst, sem):
         _, h0 = coords(j)
-        return pltpu.make_async_copy(out_buf.at[s], pool_ref.at[dst, pl.ds(h0, hb_size)], sem.at[s])
+        return pltpu.make_async_copy(
+            out_buf.at[s, pl.ds(r * hb_size, hb_size)],
+            pool_ref.at[dst, pl.ds(h0, hb_size)],
+            sem.at[s, r],
+        )
 
     def start_read(j, s):
-        src = src_ref[j // nhb]
+        b0, _ = coords(j)
+        for r in range(R):
+            src = src_ref[b0 + r]
 
-        @pl.when(src >= 0)
-        def _():
-            read_copy(j, s, src).start()
+            @pl.when(src >= 0)
+            def _():
+                read_copy(j, s, r, src).start()
 
     def wait_writes(j, s):
-        b = j // nhb
-        dst = dst_ref[b]
-        tdst = tdst_ref[b]
+        b0, _ = coords(j)
+        for r in range(R):
+            dst = dst_ref[b0 + r]
+            tdst = tdst_ref[b0 + r]
 
-        @pl.when(dst >= 0)
-        def _():
-            write_copy(j, s, dst, sem_out).wait()
+            @pl.when(dst >= 0)
+            def _():
+                write_copy(j, s, r, dst, sem_out).wait()
 
-        @pl.when(tdst >= 0)
-        def _():
-            write_copy(j, s, tdst, sem_trk).wait()
+            @pl.when(tdst >= 0)
+            def _():
+                write_copy(j, s, r, tdst, sem_trk).wait()
 
     @pl.when(i == 0)
     def _():
@@ -164,16 +178,19 @@ def _kda_decode_kernel(
         def _():
             start_read(i + 1, 1 - slot)
 
-    b = i // nhb
-    src = src_ref[b]
+    b0, _ = coords(i)
+    for r in range(R):
+        src = src_ref[b0 + r]
 
-    @pl.when(src >= 0)
-    def _():
-        read_copy(i, slot, src).wait()
+        @pl.when(src >= 0)
+        def _():
+            read_copy(i, slot, r, src).wait()
 
-    @pl.when(src < 0)
-    def _():
-        in_buf[slot] = jnp.zeros(in_buf.shape[1:], in_buf.dtype)
+        @pl.when(src < 0)
+        def _():
+            in_buf[slot, pl.ds(r * hb_size, hb_size)] = jnp.zeros(
+                (hb_size,) + in_buf.shape[2:], in_buf.dtype
+            )
 
     # out_buf[slot] was last used by step i-2: its writebacks must land first.
     if n_steps > 2:
@@ -190,69 +207,71 @@ def _kda_decode_kernel(
     #               (hi + mid + lo == x, every partial sum exact in f32).
     #   "mxu_head": same, one matmul per head.
     #   "xlu":      transpose + lane-broadcast (XLU-bound; ~1.7x more bundles).
-    x = x_ref[0]  # [Hb, 4K + V]
-    if column_mode in ("mxu", "mxu_head"):
-        p = sel_ref.shape[0] // 3
-        parts = []
-        for part in _split3_bf16(x[:, : _N_COLS * K]):
-            if p > hb_size:
-                part = jnp.concatenate(
-                    [part, jnp.zeros((p - hb_size, _N_COLS * K), part.dtype)], axis=0
-                )
-            parts.append(part)
-        lhs = jnp.concatenate(parts, axis=0)  # [3P, 4K]
+    for r in range(R):
+        x = x_ref[r]  # [Hb, 4K + V]
+        if column_mode in ("mxu", "mxu_head"):
+            p = sel_ref.shape[0] // 3
+            parts = []
+            for part in _split3_bf16(x[:, : _N_COLS * K]):
+                if p > hb_size:
+                    part = jnp.concatenate(
+                        [part, jnp.zeros((p - hb_size, _N_COLS * K), part.dtype)], axis=0
+                    )
+                parts.append(part)
+            lhs = jnp.concatenate(parts, axis=0)  # [3P, 4K]
 
-    if column_mode == "mxu_head":
-        head_cols = {}
+        if column_mode == "mxu_head":
+            head_cols = {}
 
-        def column(t, h):
-            if h not in head_cols:
-                head_cols[h] = jax.lax.dot_general(
-                    lhs,
-                    sel_ref[:, pl.ds(h * V, V)],
-                    (((0,), (0,)), ((), ())),
-                    preferred_element_type=jnp.float32,
-                )  # [4K, V]
-            return head_cols[h][t * K : (t + 1) * K]
+            def column(t, h):
+                if h not in head_cols:
+                    head_cols[h] = jax.lax.dot_general(
+                        lhs,
+                        sel_ref[:, pl.ds(h * V, V)],
+                        (((0,), (0,)), ((), ())),
+                        preferred_element_type=jnp.float32,
+                    )  # [4K, V]
+                return head_cols[h][t * K : (t + 1) * K]
 
-    elif column_mode == "mxu":
-        cols_ref[...] = jax.lax.dot_general(
-            lhs,
-            sel_ref[...],
-            (((0,), (0,)), ((), ())),
-            preferred_element_type=jnp.float32,
-        )  # [4K, Hb*V]: cols[t*K + k, h*V + v] = x[h, t*K + k]
+        elif column_mode == "mxu":
+            cols_ref[...] = jax.lax.dot_general(
+                lhs,
+                sel_ref[...],
+                (((0,), (0,)), ((), ())),
+                preferred_element_type=jnp.float32,
+            )  # [4K, Hb*V]: cols[t*K + k, h*V + v] = x[h, t*K + k]
 
-        def column(t, h):
-            return cols_ref[pl.ds(t * K, K), pl.ds(h * V, V)]
+            def column(t, h):
+                return cols_ref[pl.ds(t * K, K), pl.ds(h * V, V)]
 
-    else:
-        xT = [x[:, t * K : (t + 1) * K].T for t in range(_N_COLS)]  # [K, Hb] each
+        else:
+            xT = [x[:, t * K : (t + 1) * K].T for t in range(_N_COLS)]  # [K, Hb] each
 
-        def column(t, h):
-            return xT[t][:, h : h + 1]
+            def column(t, h):
+                return xT[t][:, h : h + 1]
 
-    # ---- recurrence (fp32, naive_recurrent_kda operation order) -------------
-    v_blk = x[:, _N_COLS * K :]  # [Hb, V]
-    for h in range(hb_size):
-        s0 = in_buf[slot, h].astype(jnp.float32)  # [K, V]
-        s1 = s0 * column(0, h)  # decay
-        u = jnp.sum(column(1, h) * s1, axis=0, keepdims=True)  # [1, V]  k^T S'
-        res = v_blk[h : h + 1, :] - u
-        s2 = s1 + column(2, h) * res  # + (beta k) (x) res
-        out_buf[slot, h] = s2.astype(out_buf.dtype)
-        o_ref[0, pl.ds(h, 1), :] = jnp.sum(column(3, h) * s2, axis=0, keepdims=True)
+        # ---- recurrence (fp32, naive_recurrent_kda operation order) -------------
+        v_blk = x[:, _N_COLS * K :]  # [Hb, V]
+        for h in range(hb_size):
+            s0 = in_buf[slot, r * hb_size + h].astype(jnp.float32)  # [K, V]
+            s1 = s0 * column(0, h)  # decay
+            u = jnp.sum(column(1, h) * s1, axis=0, keepdims=True)  # [1, V]  k^T S'
+            res = v_blk[h : h + 1, :] - u
+            s2 = s1 + column(2, h) * res  # + (beta k) (x) res
+            out_buf[slot, r * hb_size + h] = s2.astype(out_buf.dtype)
+            o_ref[r, pl.ds(h, 1), :] = jnp.sum(column(3, h) * s2, axis=0, keepdims=True)
 
-    dst = dst_ref[b]
-    tdst = tdst_ref[b]
+    for r in range(R):
+        dst = dst_ref[b0 + r]
+        tdst = tdst_ref[b0 + r]
 
-    @pl.when(dst >= 0)
-    def _():
-        write_copy(i, slot, dst, sem_out).start()
+        @pl.when(dst >= 0)
+        def _():
+            write_copy(i, slot, r, dst, sem_out).start()
 
-    @pl.when(tdst >= 0)
-    def _():
-        write_copy(i, slot, tdst, sem_trk).start()
+        @pl.when(tdst >= 0)
+        def _():
+            write_copy(i, slot, r, tdst, sem_trk).start()
 
     @pl.when(i == n_steps - 1)
     def _():
@@ -314,7 +333,10 @@ def kda_decode_pool(
     hb = heads_per_block or default_heads_per_block(H, pool.dtype)
     assert H % hb == 0 and (hb % 8 == 0 or hb == H), (H, hb)
     nhb = H // hb
-    n_steps = B * nhb
+    # SGLJAX_KDA_DECODE_REQS: requests per grid step (largest divisor of B <= the knob; default 1)
+    want = max(1, int(os.environ.get("SGLJAX_KDA_DECODE_REQS", "1")))
+    R = max(r for r in range(1, min(want, B) + 1) if B % r == 0)
+    n_steps = (B // R) * nhb
 
     # Same fp32 elementwise prologue as naive_recurrent_kda; one small fused pass.
     f32 = jnp.float32
@@ -363,29 +385,30 @@ def kda_decode_pool(
         head_k=K,
         head_v=V,
         column_mode=column_mode,
+        reqs=R,
     )
-    vmem = vmem_bytes_per_step(hb, K, V, pool.dtype, column_mode)
+    vmem = vmem_bytes_per_step(hb, K, V, pool.dtype, column_mode) * R
     o, new_pool = pl.pallas_call(
         kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=3,
             grid=(n_steps,),
             in_specs=[
-                pl.BlockSpec((1, hb, _N_COLS * K + V), blk),
+                pl.BlockSpec((R, hb, _N_COLS * K + V), blk),
                 pl.BlockSpec(sel.shape, lambda i, *_: (0, 0)),
                 pl.BlockSpec(memory_space=pltpu.HBM),
             ],
             out_specs=[
-                pl.BlockSpec((1, hb, V), blk),
+                pl.BlockSpec((R, hb, V), blk),
                 pl.BlockSpec(memory_space=pltpu.HBM),
             ],
             scratch_shapes=[
-                pltpu.VMEM((2, hb, K, V), pool.dtype),
-                pltpu.VMEM((2, hb, K, V), pool.dtype),
+                pltpu.VMEM((2, R * hb, K, V), pool.dtype),
+                pltpu.VMEM((2, R * hb, K, V), pool.dtype),
                 cols_scratch,
-                pltpu.SemaphoreType.DMA((2,)),
-                pltpu.SemaphoreType.DMA((2,)),
-                pltpu.SemaphoreType.DMA((2,)),
+                pltpu.SemaphoreType.DMA((2, R)),
+                pltpu.SemaphoreType.DMA((2, R)),
+                pltpu.SemaphoreType.DMA((2, R)),
             ],
         ),
         out_shape=[
@@ -399,7 +422,7 @@ def kda_decode_pool(
             vmem_limit_bytes=max(32 << 20, vmem + (16 << 20)),
         ),
         interpret=interpret,
-        name=f"kda_decode_h{H}_hb{hb}_{column_mode}",
+        name=f"kda_decode_h{H}_hb{hb}_{column_mode}" + (f"_r{R}" if R > 1 else ""),
     )(src, dst, tdst, x, sel, pool)
     return o.astype(v.dtype), new_pool
 
