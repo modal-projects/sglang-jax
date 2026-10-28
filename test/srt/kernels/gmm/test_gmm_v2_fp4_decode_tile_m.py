@@ -34,7 +34,7 @@ def _run(env, x, w, s, gs, off):
         jax.clear_caches()
         out = g2.gmm_v2(x, w, gs, rhs_scale=s, group_offset=off, preferred_element_type=jnp.bfloat16,
                         acc_dtype=jnp.float32, maybe_quantize_lhs=False, rhs_fp4_packed=True, zero_initialize=False,
-                        interpret=pltpu.InterpretParams(uninitialized_memory="zero"))
+                        interpret=pltpu.InterpretParams(uninitialized_memory="zero", out_of_bounds_reads="uninitialized"))
         return np.asarray(out.astype(jnp.float32))
     finally:
         for k, v in old.items():
