@@ -67,7 +67,7 @@ _layer_nan_reports = [0]
 
 def _report_layer_nans(bad, positions, mode):
     bad = np.asarray(bad)
-    if not bad.any() or _layer_nan_reports[0] >= 20:
+    if not bad.any() or _layer_nan_reports[0] >= 300:
         return
     _layer_nan_reports[0] += 1
     first_layer = int(np.argmax(bad.any(axis=1)))
