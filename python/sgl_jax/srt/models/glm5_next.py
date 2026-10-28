@@ -323,6 +323,18 @@ class Glm5NextDecoderLayer(nnx.Module):
                 if eplb is not None
                 else None
             )
+            # Logical -> physical replicas of this layer as host constants (tuples: nnx leaves
+            # plain Python data alone). Routing spreads each logical expert's rows over its
+            # replicas round-robin by (token, k) -- the shared "static" map always picks
+            # replica 0, so redundant slots would sit idle.
+            if eplb is not None:
+                l2all = np.asarray(jax.device_get(eplb.logical_to_all_physical_map))[layer_id]
+                nv = np.maximum((l2all >= 0).sum(-1), 1)
+                self._eplb_l2all = tuple(map(tuple, np.where(l2all >= 0, l2all, 0).tolist()))
+                self._eplb_nv = tuple(int(x) for x in nv)
+            else:
+                self._eplb_l2all = None
+                self._eplb_nv = None
             self.mlp = EPMoE(
                 physical_to_logical_map=ptl,
                 hidden_size=config.hidden_size,
@@ -389,9 +401,14 @@ class Glm5NextDecoderLayer(nnx.Module):
         # ---- MLP sublayer ----
         if self.is_moe_layer:
             router_logits = self.moe_gate(h)
+            eplb_l2all = getattr(self, "_eplb_l2all", None)
             topk_weights, topk_ids = self.topk(
-                router_logits, self.moe_gate.bias.value, dispatch_info=dispatch_info
+                router_logits,
+                self.moe_gate.bias.value,
+                dispatch_info=None if eplb_l2all is not None else dispatch_info,
             )
+            if eplb_l2all is not None:
+                topk_ids = _eplb_logical_to_physical(topk_ids, eplb_l2all, self._eplb_nv)
             if self.moe_backend == MoEBackend.EPMOE:
                 # Opt-in (SGLANG_JAX_ONESHOT_AR_MIN_BYTES>0, SITES has "fused"): shared down_proj
                 # and the EPMoE combine return per-device partials, reduced with one all-reduce
@@ -514,6 +531,21 @@ class Glm5NextModel(nnx.Module):
             layers_topk_ids,
             aux_hidden_states,
         )
+
+
+def _eplb_logical_to_physical(topk_ids, l2all, nv):
+    """[T, k] logical ids -> physical slots: replica (t * k + j) % num_replicas of each logical
+    expert, from host-constant tables (spreads hot experts over their redundant slots)."""
+    l2all = jnp.asarray(np.asarray(l2all, np.int32))  # [E, R]
+    nv = jnp.asarray(np.asarray(nv, np.int32))  # [E]
+    t, k = topk_ids.shape
+    ids = topk_ids.astype(jnp.int32)
+    rr = (
+        jax.lax.broadcasted_iota(jnp.int32, (t, k), 0) * k
+        + jax.lax.broadcasted_iota(jnp.int32, (t, k), 1)
+    ) % nv[ids]
+    flat = ids * l2all.shape[1] + rr
+    return l2all.reshape(-1)[flat].astype(topk_ids.dtype)
 
 
 class Glm5NextForConditionalGeneration(nnx.Module):
