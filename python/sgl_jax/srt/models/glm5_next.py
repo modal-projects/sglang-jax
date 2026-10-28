@@ -312,7 +312,19 @@ class Glm5NextDecoderLayer(nnx.Module):
         self.moe_gate, self.topk = moe_router(config, mesh, layer_id)
         self.moe_backend = getattr(config, "moe_backend", MoEBackend.FUSED_V2)
         if self.moe_backend == MoEBackend.EPMOE:
+            # EPLB (--ep-num-redundant-experts / --init-expert-location): EPMoE sizes itself to the
+            # physical slots from the global metadata; the loader fills slot p with logical expert
+            # physical_to_logical_map[layer_id][p] (load_weights reads mlp.physical_to_logical_map).
+            from sgl_jax.srt.eplb.expert_location import get_global_expert_location_metadata
+
+            eplb = get_global_expert_location_metadata()
+            ptl = (
+                np.asarray(jax.device_get(eplb.physical_to_logical_map))[layer_id]
+                if eplb is not None
+                else None
+            )
             self.mlp = EPMoE(
+                physical_to_logical_map=ptl,
                 hidden_size=config.hidden_size,
                 num_experts=config.n_routed_experts,
                 num_experts_per_tok=config.num_experts_per_tok,
@@ -508,6 +520,18 @@ class Glm5NextForConditionalGeneration(nnx.Module):
     """Serving class for `zai-org/GLM-5.3-Flash` (HF arch `Glm5NextForConditionalGeneration`)."""
 
     @classmethod
+
+    @classmethod
+    def get_expert_location_config(cls, hf_config) -> dict:
+        """EPLB fields (GLM-5.3 names its routed-expert count n_routed_experts); the per-layer
+        maps are indexed by absolute layer id (the first_k_dense_replace dense layers get zero
+        counts and keep a trivial map)."""
+        return {
+            "num_experts": int(getattr(hf_config, "n_routed_experts", 0)),
+            "num_layers": int(getattr(hf_config, "num_hidden_layers", 0)),
+            "num_groups": int(getattr(hf_config, "n_group", 1) or 1),
+        }
+
     def patch_model_config(cls, config: ModelConfig) -> None:
         from sgl_jax.srt.configs.model_config import AttentionArch
 
