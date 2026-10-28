@@ -127,7 +127,8 @@ def test_materialize_into_swa_pool_dp4(mesh, monkeypatch):
                 m = np.asarray(ref_alloc.full_to_swa_index_mapping[r])
                 swa_loc[sl] = np.where(live[sl], m[np.maximum(cache_loc[sl], 0)], -1)
             k, v = kv[layer]
-            ref_pool.swa_kv_pool.set_kv_buffer(layer, jnp.asarray(swa_loc), k, v)
+            swa_loc = jax.device_put(swa_loc, jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("data")))
+            ref_pool.swa_kv_pool.set_kv_buffer(layer, swa_loc, k, v)
 
     for layer in range(LAYERS):
         got = np.asarray(pool.get_fused_kv_buffer(layer).astype(jnp.float32))
