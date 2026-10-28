@@ -16,6 +16,7 @@ from sgl_jax.srt.kernels.kda import (
     resident_pipeline_kda_fwd,
 )
 from sgl_jax.srt.kernels.kda.decode import kda_decode_pool
+from sgl_jax.srt.kernels.kda.verify import kda_multistep
 from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
     LinearRecurrentAttnBackend,
 )
@@ -138,15 +139,20 @@ def _commit_state_naive(record, steps, T):
         # Zero k/v too: 0 * NaN from a rejected/padded step would still poison the state.
         k = jnp.where(live[..., None, None], k, jnp.zeros_like(k))
         v = jnp.where(live[..., None, None], v, jnp.zeros_like(v))
-        _, state = naive_recurrent_kda(
-            jnp.zeros_like(k),
-            k,
-            v,
-            g,
-            beta,
-            initial_state=h0,
-            output_final_state=True,
-        )
+        if _VERIFY_KERNEL:
+            _, state = kda_multistep(
+                jnp.zeros_like(k), k, v, g, beta, h0, output_final_state=True
+            )
+        else:
+            _, state = naive_recurrent_kda(
+                jnp.zeros_like(k),
+                k,
+                v,
+                g,
+                beta,
+                initial_state=h0,
+                output_final_state=True,
+            )
         return state.astype(h0.dtype)
 
     return jax.shard_map(
@@ -244,6 +250,11 @@ _CONV_DENSE = os.environ.get("SGLJAX_KDA_CONV_DENSE", "0") == "1"
 # Opt-in: DFlash TARGET_VERIFY / commit through the chunked prefill kernel instead of the
 # token-by-token naive recurrence (v8a 226 profile, c32 k8: naive verify + replay = ~35 of 88 ms).
 _VERIFY_CHUNK = os.environ.get("SGLJAX_KDA_VERIFY_CHUNK", "0") == "1"
+# Opt-in: DFlash verify + commit recurrence in a Pallas kernel with the state resident in VMEM across
+# the T tokens (kernels/kda/verify.py). v8a 228 showed the chunked prefill kernel (above) is ~7x
+# SLOWER at verify shapes (grid N x H x total-chunks, one chunk per 4-8-token request); this is the
+# replacement. Same math and record layout as the naive path.
+_VERIFY_KERNEL = os.environ.get("SGLJAX_KDA_VERIFY_KERNEL", "0") == "1"
 
 
 def _prec(dtype):
@@ -926,9 +937,12 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
             b_local = h0.shape[0]
             r = lambda x: x.reshape((b_local, T) + x.shape[1:])
             q, k, v, g, beta = map(r, (q, k, v, g, beta))
-            o, _ = naive_recurrent_kda(
-                q, k, v, g, beta, scale=scale, initial_state=h0, output_final_state=False
-            )
+            if _VERIFY_KERNEL:
+                o, _ = kda_multistep(q, k, v, g, beta, h0, scale=scale)
+            else:
+                o, _ = naive_recurrent_kda(
+                    q, k, v, g, beta, scale=scale, initial_state=h0, output_final_state=False
+                )
             return o.reshape((b_local * T,) + o.shape[2:]), k, v, g, beta
 
         tok = P("data", "tensor", None)

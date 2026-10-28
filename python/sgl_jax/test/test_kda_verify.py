@@ -89,12 +89,19 @@ def _snapshot(pool, recurrent_indices):
     )
 
 
-@pytest.mark.parametrize("chunk", [False, True])
+@pytest.mark.parametrize("chunk", [False, True, "kernel"])
 @pytest.mark.parametrize("dtype,tol", [(jnp.float32, 1e-5), (jnp.bfloat16, 2e-2)])
 def test_kda_verify_matches_sequential_decode_and_commits_accepted_prefix(
     dtype, tol, chunk, monkeypatch
 ):
-    if chunk:
+    if chunk == "kernel":
+        # SGLJAX_KDA_VERIFY_KERNEL=1: multi-token Pallas recurrence (interpreted on CPU).
+        import sgl_jax.srt.layers.attention.linear.kda_backend as kb
+
+        monkeypatch.setattr(kb, "_VERIFY_KERNEL", True)
+        monkeypatch.setenv("PALLAS_INTERPRET", "1")
+        tol = max(tol, 2e-4)
+    elif chunk:
         # SGLJAX_KDA_VERIFY_CHUNK=1 path: chunked prefill kernel (interpreted on CPU).
         import sgl_jax.srt.layers.attention.linear.kda_backend as kb
 
