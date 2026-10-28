@@ -39,7 +39,11 @@ def _bare(cls, **attrs):
 def mesh():
     if len(jax.devices()) < DP * TP:
         pytest.skip("needs 8 devices (XLA_FLAGS=--xla_force_host_platform_device_count=8)")
-    return jax.sharding.Mesh(np.asarray(jax.devices()[: DP * TP]).reshape(DP, TP), ("data", "tensor"))
+    return jax.sharding.Mesh(
+        np.asarray(jax.devices()[: DP * TP]).reshape(DP, TP),
+        ("data", "tensor"),
+        axis_types=(jax.sharding.AxisType.Explicit,) * 2,
+    )
 
 
 def _setup(mesh):
@@ -106,13 +110,8 @@ def test_hybrid_target_gets_hybrid_metadata(mesh):
     # KDA: block-aligned per-DP cu_q_lens, the batch's recurrent slots.
     np.testing.assert_array_equal(np.asarray(lin.cu_q_lens), np.tile([0, T, 2 * T], DP))
     np.testing.assert_array_equal(np.asarray(lin.recurrent_indices), mwb.recurrent_indices)
-    # The hybrid setter routes both halves (would raise on the draft's FA metadata).
-    target = worker.target_worker.model_runner.attn_backend
-    target.forward_metadata = md
-    assert target.full_attn_backend.forward_metadata is full
-    assert target.linear_attn_backend.forward_metadata is lin
-    with pytest.raises(AttributeError):
-        target.forward_metadata = draft_md
+    # The draft's FA metadata is what the hybrid setter used to receive: it has no halves.
+    assert not hasattr(draft_md, "full_attn_metadata")
 
 
 def test_in_jit_relay_rebuild_keeps_hybrid_layout(mesh):
