@@ -126,7 +126,7 @@ def fp4_decode_tile_m(dims) -> int:
     decode an expert sees ~5 rows, so 16 rows cover nearly every group in one tile (a group with
     more rows takes more m-tiles; the weight block is not re-fetched).
 
-      SGLJAX_FP4_DECODE_TILE_M  32 (default) | 16 | auto (16 when the mean rows per expert
+      SGLJAX_FP4_DECODE_TILE_M  32 (default) | 16 | 8 | auto (16 when the mean rows per expert
                                 is <= 12; under EP the lhs holds every rank's rows, so the
                                 basis is the larger of the local and global group counts)
     """
@@ -135,8 +135,8 @@ def fp4_decode_tile_m(dims) -> int:
         groups = max(dims.size_group, dims.size_lhs_group)
         return 16 if dims.size_m <= 12 * groups else FP4_PACKED_MAX_TILE_M
     tm = int(v)
-    if tm not in (16, 32):
-        raise ValueError(f"SGLJAX_FP4_DECODE_TILE_M must be 16, 32 or auto, got {v!r}")
+    if tm not in (8, 16, 32):
+        raise ValueError(f"SGLJAX_FP4_DECODE_TILE_M must be 8, 16, 32 or auto, got {v!r}")
     return tm
 
 
