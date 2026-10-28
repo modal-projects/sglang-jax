@@ -190,6 +190,21 @@ def export(options):
                 if options.save_executable:
                     manifest["executable"] = json.loads((output / "executable.json").read_text())
                     manifest["stages"]["executable"] = "complete"
+                try:
+                    mem = compiled.memory_analysis()
+                    manifest["memory_analysis"] = {
+                        k: int(getattr(mem, k))
+                        for k in (
+                            "temp_size_in_bytes",
+                            "argument_size_in_bytes",
+                            "output_size_in_bytes",
+                            "alias_size_in_bytes",
+                            "generated_code_size_in_bytes",
+                        )
+                        if hasattr(mem, k)
+                    }
+                except Exception as e:  # noqa: BLE001 - diagnostics only
+                    manifest["memory_analysis"] = {"error": repr(e)}
                 hlo = compiled.as_text()
                 if not hlo or "HloModule" not in hlo:
                     raise RuntimeError("Backend did not expose optimized HLO text")

@@ -21,6 +21,7 @@ Two entry points:
 from __future__ import annotations
 
 import functools
+import os
 
 import jax
 import jax.numpy as jnp
@@ -29,6 +30,11 @@ from sgl_jax.srt.kernels.mla.v2.kernel import (
     get_kv_cache_shape,
     mla_ragged_paged_attention,
 )
+
+
+# Bitmap fast path of compute_topk_pages: cap on T * selected * pages_per_seq compare elements
+# (SGLJAX_DSA_PAGES_BITMAP=0 disables it).
+_BITMAP_MAX_ELEMS = (1 << 27) if os.environ.get("SGLJAX_DSA_PAGES_BITMAP", "1") != "0" else -1
 
 
 @functools.partial(jax.jit, static_argnames=("page_size", "pages_per_seq", "k_pages_max"))
@@ -52,6 +58,17 @@ def compute_topk_pages(
     valid = (topk_indices >= 0) & (pages < pages_per_seq)
     # The sentinel sorts after every valid page so invalid entries drop out.
     pages = jnp.where(valid, pages, pages_per_seq)
+    t, sel = pages.shape
+    if pages_per_seq <= k_pages_max and t * sel * pages_per_seq <= _BITMAP_MAX_ELEMS:
+        # Every touched page fits, so the best-rank selection below keeps all of them: the
+        # result is just the ascending set of touched pages. One fused compare+any over
+        # [T, sel, pages_per_seq] replaces the [T, sel] sort + top_k + take_along_axis + sort
+        # (v6e-16 EP16 decode at c128: ~8 ms/step over 11 layers, mostly the gather and sorts).
+        page_ids = jnp.arange(pages_per_seq, dtype=pages.dtype)
+        hit = jnp.any(pages[:, :, None] == page_ids[None, None, :], axis=1)  # [T, pps]
+        hit_pages = jnp.sort(jnp.where(hit, page_ids[None, :], pages_per_seq), axis=-1)
+        hit_pages = jnp.where(hit_pages < pages_per_seq, hit_pages, -1).astype(jnp.int32)
+        return jnp.pad(hit_pages, ((0, 0), (0, k_pages_max - pages_per_seq)), constant_values=-1)
     rank = jnp.broadcast_to(jnp.arange(pages.shape[-1], dtype=jnp.int32), pages.shape)
     # Stable sort by page keeps each page's best-ranked slot first in its run.
     pages, rank = jax.lax.sort((pages, rank), dimension=-1, num_keys=1, is_stable=True)
