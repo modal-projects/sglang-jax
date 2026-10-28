@@ -50,25 +50,25 @@ def test_decode_tile_m(sizes):
     from sgl_jax.srt.utils.quantization.mxfp4 import packed_fp4_to_dense
 
     rng = np.random.default_rng(0)
-    K, N, G = 256, 256, 4  # local experts 1..4 of 6 (group_offset 1)
+    K, N, G = 256, 256, 6
     gs = np.asarray(sizes, np.int32)
     m = int(gs.sum())
     w = rng.integers(0, 2**32, size=(G, K // 8, N), dtype=np.uint32)
     e = rng.integers(-4, 5, size=(G, K // 32, N))
     s = np.ldexp(np.ones(e.shape, np.float32), e + 14).astype(ml_dtypes.bfloat16)
     x = (rng.standard_normal((m, K)) * 0.5).astype(ml_dtypes.bfloat16)
-    args = (jnp.asarray(x), jnp.asarray(w), jnp.asarray(s), jnp.asarray(gs), jnp.asarray([1], jnp.int32))
+    args = (jnp.asarray(x), jnp.asarray(w), jnp.asarray(s), jnp.asarray(gs), jnp.asarray([0], jnp.int32))
     base = {"SGLJAX_FP4_PATH": "decode"}
     o32 = _run({**base, "SGLJAX_FP4_DECODE_TILE_M": "32"}, *args)
     o16 = _run({**base, "SGLJAX_FP4_DECODE_TILE_M": "16"}, *args)
     oau = _run({**base, "SGLJAX_FP4_DECODE_TILE_M": "auto"}, *args)
-    lo, hi = int(gs[:1].sum()), int(gs[: 1 + G].sum())
+    lo, hi = 0, m
     np.testing.assert_array_equal(o16[lo:hi], o32[lo:hi])
     np.testing.assert_array_equal(oau[lo:hi], o32[lo:hi])
     ref = np.zeros((m, N), np.float32)
     r = lo
     for g in range(G):
-        n_g = int(gs[1 + g])
+        n_g = int(gs[g])
         dense = packed_fp4_to_dense(w[g], np.asarray(s[g], np.float32))
         ref[r : r + n_g] = np.asarray(x[r : r + n_g], np.float32) @ dense
         r += n_g
