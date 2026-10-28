@@ -1129,8 +1129,14 @@ class EPMoE(nnx.Module):
         tokens = disp["inputs_2d"].shape[0]
         # Combine by a one-hot matmul instead of a scatter-add (XLA:TPU's scatter emitter crashes
         # on this pattern; [tokens, r_cap] x [r_cap, H] is tiny on the MXU, exact at HIGHEST).
+        # NaN-safe: a non-finite row of one token (e.g. a padding row of a spec-verify batch)
+        # must not reach the other tokens through 0 * NaN in the matmul; it is re-marked as NaN
+        # only on the token that owns it.
         onehot = (tok[None, :] == jnp.arange(tokens, dtype=tok.dtype)[:, None]).astype(jnp.float32)
-        output = jnp.matmul(onehot, contrib, precision=jax.lax.Precision.HIGHEST)
+        finite = jnp.isfinite(contrib)
+        output = jnp.matmul(onehot, jnp.where(finite, contrib, 0.0), precision=jax.lax.Precision.HIGHEST)
+        bad = jnp.matmul(onehot, (~finite).astype(jnp.float32)) > 0
+        output = jnp.where(bad, jnp.float32(jnp.nan), output)
         return output.astype(self.dtype)
 
     def _experts_local_unreduced(
