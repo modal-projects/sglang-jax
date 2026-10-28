@@ -118,6 +118,28 @@ def fp4_packed_use_full_k(dims) -> bool:
 FP4_PACKED_FULL_K_MAX_TILE_N = 512
 
 
+def fp4_decode_tile_m(dims) -> int:
+    """tile_m of the packed-FP4 K32 block-dot (decode) path. Every K32 block pops and rescales a
+    [tile_m, tile_n] f32 partial (pop + mul + add per vreg), so rows of padding cost VPU time: v6e
+    LLO (AOT, gate tile 4096x2048) 8436 bundles at tile_m 32 vs 6715 at 16 (HBM time ~6800 at
+    1.1 TB/s), i.e. the 32-row tile is VPU-bound and the 16-row tile is not. Under wide EP at
+    decode an expert sees ~5 rows, so 16 rows cover nearly every group in one tile (a group with
+    more rows takes more m-tiles; the weight block is not re-fetched).
+
+      SGLJAX_FP4_DECODE_TILE_M  32 (default) | 16 | auto (16 when the mean rows per expert
+                                is <= 12; under EP the lhs holds every rank's rows, so the
+                                basis is the larger of the local and global group counts)
+    """
+    v = os.environ.get("SGLJAX_FP4_DECODE_TILE_M", "32")
+    if v == "auto":
+        groups = max(dims.size_group, dims.size_lhs_group)
+        return 16 if dims.size_m <= 12 * groups else FP4_PACKED_MAX_TILE_M
+    tm = int(v)
+    if tm not in (16, 32):
+        raise ValueError(f"SGLJAX_FP4_DECODE_TILE_M must be 16, 32 or auto, got {v!r}")
+    return tm
+
+
 def expand_fp4_packed_e5m2(words: jax.Array) -> jax.Array:
     """Packed E2M1 -> E5M2, exactly, with SWAR mask/shift (4 values per 32-bit op).
 
@@ -1276,7 +1298,7 @@ def make_gmm_configs(
         elif rhs_fp4_packed and tiles.tile_m > FP4_PACKED_MAX_TILE_M:
             # The K32 block-dot loop's cost grows with rows per tile: on v5e/v6e tile_m > 32 is
             # 1.7-2x slower at 48-96 rows/device (fp4p_tile_sweep), while <= 32 rows is unaffected.
-            tiles = dataclasses.replace(tiles, tile_m=FP4_PACKED_MAX_TILE_M)
+            tiles = dataclasses.replace(tiles, tile_m=fp4_decode_tile_m(dims))
         if glu_chunk:
             # The auto-tiler only sizes tile_n for VMEM (bf16 k=6144 n=4096 -> 1408 on v6e/v7x);
             # snap it down to whole [gate | up] chunk pairs so the epilogue tiles line up. Rounding
