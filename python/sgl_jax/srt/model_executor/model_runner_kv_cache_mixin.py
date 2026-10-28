@@ -413,6 +413,31 @@ class ModelRunnerKVCacheMixin:
             main_kv += extra(dtype_size)
         return main_kv
 
+    def _dflash_draft_cell_size(self: ModelRunner) -> int:
+        """Per-device bytes per token of a DFlash draft's KV pool (0 if not DFlash)."""
+        algo = self.spec_algorithm
+        if algo is None or not getattr(algo, "is_dflash_family", lambda: False)():
+            return 0
+        import json
+        import os
+
+        from sgl_jax.srt.utils.jax_utils import get_num_kv_heads_by_tp
+
+        path = os.path.join(self.server_args.speculative_draft_model_path or "", "config.json")
+        try:
+            with open(path) as f:
+                cfg = json.load(f)
+        except OSError:
+            logger.warning("DFLASH draft config not readable at %s; draft pool not budgeted", path)
+            return 0
+        cfg = cfg.get("text_config", cfg)
+        heads = int(cfg.get("num_key_value_heads") or cfg["num_attention_heads"])
+        head_dim = int(cfg.get("head_dim") or cfg["hidden_size"] // cfg["num_attention_heads"])
+        layers = int(cfg["num_hidden_layers"])
+        per_dev_heads = get_num_kv_heads_by_tp(heads, self.attention_tp_size)
+        dtype_size = jnp.dtype(self.kv_cache_dtype).itemsize
+        return int(per_dev_heads * ((head_dim + 127) // 128 * 128) * 2 * layers * dtype_size)
+
     def _profile_available_bytes(self: ModelRunner, total_device_memory: int) -> int:
         """Profile available bytes for KV cache (+ recurrent state)."""
         rest_memory = (
@@ -513,6 +538,14 @@ class ModelRunnerKVCacheMixin:
                 overhead_bytes,
             )
             available_kv_cache_bytes -= overhead_bytes
+            # DFlash: the draft pool is indexed by the target's token slots (shared allocator), so
+            # it holds as many tokens as the target pool. Charge its per-token bytes here, or it
+            # lands outside --mem-fraction-static and eats the prefill temporaries (v16 034f7:
+            # 1.9 GB/chip draft pool -> 4096-token prefill program OOM at MEMFRAC 0.78).
+            draft_cell = self._dflash_draft_cell_size()
+            if draft_cell:
+                logger.info("DFLASH draft pool shares target slots: +%d bytes/token", draft_cell)
+                cell_size += draft_cell
 
         max_tokens = max(1, int(available_kv_cache_bytes // cell_size))
 
