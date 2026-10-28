@@ -85,6 +85,14 @@ FP4_PACKED_FULL_K_MIN_ROWS_PER_GROUP = 96
 FP4_PACKED_FULL_K_TILE_M = 256
 
 
+def _fp4_decode_scale_weights() -> bool:
+    """SGLJAX_FP4_DECODE_SCALEW=1 (trace time): on decode tiles (tile_m <= 32) too, scale the
+    expanded weights by their power-of-two K32 scales in bf16 (exact) and run ONE full-K matmul,
+    instead of tile_k/32 K=32-deep matmuls (each a separate MXU weight push using 1/8 of the
+    array) with an f32 rescale-accumulate of the [tile_m, tile_n] output per block."""
+    return os.environ.get("SGLJAX_FP4_DECODE_SCALEW", "0") == "1"
+
+
 def fp4_packed_use_full_k(dims) -> bool:
     """Trace-time choice between the packed-FP4 K32 block-dot (decode) and full-K (prefill) paths.
 
@@ -369,7 +377,7 @@ def inner_kernel(
                 assert is_block_rhs_scale and rhs_block == 32 and valid_k == 0
                 tile_k, tile_n = cfgs.tiles.tile_k, cfgs.tiles.tile_n
                 w = expand_fp4_packed_e5m2(tiled_rhs)
-                if cfgs.tiles.tile_m > FP4_PACKED_MAX_TILE_M:
+                if cfgs.tiles.tile_m > FP4_PACKED_MAX_TILE_M or _fp4_decode_scale_weights():
                     # Prefill: scale the expanded weights in bf16 (exact: power-of-two scale x
                     # E2M1 value) and run one full-K matmul.
                     scale = tiled_rhs_ref.scale[...].astype(jnp.bfloat16)

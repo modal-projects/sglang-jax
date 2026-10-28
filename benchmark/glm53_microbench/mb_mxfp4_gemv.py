@@ -279,7 +279,9 @@ def main():
             paths = a.fp4_paths.split(",") if is_fp4(fmt) else ["-"]
             for path in paths:
                 if is_fp4(fmt):
-                    os.environ["SGLJAX_FP4_PATH"] = path
+                    # "scalew": decode tiles with the weight-scaled full-K matmul (SGLJAX_FP4_DECODE_SCALEW)
+                    os.environ["SGLJAX_FP4_PATH"] = "decode" if path == "scalew" else path
+                    os.environ["SGLJAX_FP4_DECODE_SCALEW"] = "1" if path == "scalew" else "0"
                     jax.clear_caches()  # the path is chosen at trace time
                 for m in ms:
                     rows = m * TOPK
@@ -315,7 +317,7 @@ def main():
                             except Exception as e:  # noqa: BLE001
                                 case["path_error"] = str(e)[:300]
                             finally:
-                                os.environ["SGLJAX_FP4_PATH"] = path
+                                os.environ["SGLJAX_FP4_PATH"] = "decode" if path == "scalew" else path
                         if mode == "aot":
                             state = (SD((rows, H), jnp.bfloat16), SD((e_total,), jnp.int32),
                                      SD((1,), jnp.int32))
@@ -350,6 +352,7 @@ def main():
                                         key=(layout, fmt, path, m), mesh=aot_mesh)
                         results.append(case)
             os.environ.pop("SGLJAX_FP4_PATH", None)
+            os.environ.pop("SGLJAX_FP4_DECODE_SCALEW", None)
             del consts, w1, s1, w2, s2
             if not fused:
                 del wg, sg, wu, su
