@@ -198,25 +198,33 @@ def _prec(dtype):
     return None if jnp.dtype(dtype).itemsize <= 2 else jax.lax.Precision.HIGHEST
 
 
+def _select_einsum(eq, sel, x, prec):
+    """einsum(eq, sel, x) for a 0/1 selection matrix ``sel``, NaN/Inf-safe: a non-finite value in a
+    row that ``sel`` does not pick must not leak (0 * NaN = NaN in a plain matmul would poison every
+    output). Non-finite inputs are zeroed for the value matmul and re-marked as NaN on the outputs
+    that actually select them (a second, mask-only matmul)."""
+    finite = jnp.isfinite(x)
+    y = jnp.einsum(
+        eq, sel, jnp.where(finite, x, jnp.zeros_like(x)), preferred_element_type=jnp.float32,
+        precision=prec,
+    )
+    bad = jnp.einsum(eq, sel, (~finite).astype(sel.dtype), preferred_element_type=jnp.float32) > 0
+    return jnp.where(bad, jnp.float32(jnp.nan), y)
+
+
 def _dense_rows_get(buf, idx):
     # No flatten: a reshape of the [S, C, K-1] pool forces a relayout copy (XLA keeps C minor).
     slots = buf.shape[0]
     onehot = (idx[:, None] == jnp.arange(slots, dtype=idx.dtype)[None, :]).astype(buf.dtype)
-    out = jnp.einsum(
-        "bs,s...->b...", onehot, buf, preferred_element_type=jnp.float32, precision=_prec(buf.dtype)
-    )
+    out = _select_einsum("bs,s...->b...", onehot, buf, _prec(buf.dtype))
     return out.astype(buf.dtype)
 
 
 def _dense_rows_set(buf, idx, val, write):
     slots = buf.shape[0]
     hit = (idx[None, :] == jnp.arange(slots, dtype=idx.dtype)[:, None]) & write[None, :]  # [S, B]
-    scattered = jnp.einsum(
-        "sb,b...->s...",
-        hit.astype(buf.dtype),
-        val.astype(buf.dtype),
-        preferred_element_type=jnp.float32,
-        precision=_prec(buf.dtype),
+    scattered = _select_einsum(
+        "sb,b...->s...", hit.astype(buf.dtype), val.astype(buf.dtype), _prec(buf.dtype)
     )
     written = jnp.any(hit, axis=1).reshape((slots,) + (1,) * (buf.ndim - 1))
     return jnp.where(written, scattered.astype(buf.dtype), buf)
