@@ -92,6 +92,9 @@ def commit_kda_verify(record: KDAVerifyRecord, num_tokens: jax.Array):
         # A masked step is an exact no-op: exp(0) decay and a zero delta update.
         g = jnp.where(live[..., None, None], g, jnp.zeros_like(g))
         beta = jnp.where(live[..., None], beta, jnp.zeros_like(beta))
+        # Zero k/v too: 0 * NaN from a rejected/padded step would still poison the state.
+        k = jnp.where(live[..., None, None], k, jnp.zeros_like(k))
+        v = jnp.where(live[..., None, None], v, jnp.zeros_like(v))
         _, state = naive_recurrent_kda(
             jnp.zeros_like(k),
             k,
