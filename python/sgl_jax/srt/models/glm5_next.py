@@ -543,17 +543,23 @@ def _eplb_logical_to_physical(topk_ids, l2all, nv):
         nv = jax.sharding.reshard(nv, P())
     t, k = topk_ids.shape
     ids = topk_ids.astype(jnp.int32)
+    out_sh = getattr(jax.typeof(ids), "sharding", None)
+    spec = out_sh.spec if (out_sh is not None and mesh is not None and not mesh.empty) else None
+
+    def take(tab, idx):
+        return tab.at[idx].get(out_sharding=spec) if spec is not None else tab[idx]
+
     rr = (
         jax.lax.broadcasted_iota(jnp.int32, (t, k), 0) * k
         + jax.lax.broadcasted_iota(jnp.int32, (t, k), 1)
-    ) % nv[ids]
+    ) % take(nv, ids)
     flat = ids * l2all.shape[1] + rr
     table = l2all.reshape(-1)
     # Explicit-mesh gather: the table must live on the ids' mesh (replicated).
     mesh = jax.sharding.get_abstract_mesh()
     if mesh is not None and not mesh.empty:
         table = jax.sharding.reshard(table, P())
-    return table[flat].astype(topk_ids.dtype)
+    return take(table, flat).astype(topk_ids.dtype)
 
 
 class Glm5NextForConditionalGeneration(nnx.Module):
