@@ -146,6 +146,11 @@ _PREFILL_QBLOCK_QB = int(os.environ.get("DSA_PREFILL_QBLOCK_QB", "256"))
 # extend-shaped prefill path costs ~10 ms/step at T=4 (bq_512 indexer blocks +
 # qblock machinery); this trades it for n decode queries. Default OFF.
 _SPEC_AS_DECODE = os.environ.get("DSA_SPEC_AS_DECODE", "0") == "1"
+# Opt-in short-context fast path for DECODE: when every sequence in the batch has at most
+# index_topk tokens, the indexer's top-k selects every token, so sparse MLA over the top-k equals
+# dense MLA over the whole context. Skip the indexer scoring / top-k / page-list build (the
+# indexer-key cache is still written) and run the dense MLA kernel; same math, different kernel.
+_SHORT_DENSE = os.environ.get("SGLJAX_DSA_SHORT_DENSE", "0") == "1"
 # Query block for the page-topk indexer kernel on spec batches (T = a few tokens
 # per request; the prefill default of 512 pads 4 queries to a 512 block).
 _SPEC_INDEXER_QB = int(os.environ.get("DSA_SPEC_INDEXER_QB", "16"))
@@ -479,6 +484,55 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             )
             return o, DSAFusedCache(kv=kv_cache, idx=idx_cache, topk=None, topk_pages=None)
 
+        if _SHORT_DENSE and is_decode:
+            return self._decode_short_dense_or_sparse(
+                q, q_rope, new_kv_c, new_k_pe, kv_cache, idx_cache, q_idx, k_idx, idx_weights,
+                is_full, layer_id, dsa_topk_in, dsa_topk_pages_in, dsa_topk_reuse, sm_scale,
+                layer, dpa, md,
+            )
+        return self._decode_sparse(
+            q, q_rope, new_kv_c, new_k_pe, kv_cache, idx_cache, q_idx, k_idx, idx_weights,
+            is_full, layer_id, dsa_topk_in, dsa_topk_pages_in, dsa_topk_reuse, sm_scale, dpa, md,
+        )
+
+    def _decode_short_dense_or_sparse(
+        self, q, q_rope, new_kv_c, new_k_pe, kv_cache, idx_cache, q_idx, k_idx, idx_weights,
+        is_full, layer_id, dsa_topk_in, dsa_topk_pages_in, dsa_topk_reuse, sm_scale, layer, dpa,
+        md,
+    ):
+        """SGLJAX_DSA_SHORT_DENSE: lax.cond(all seq_lens <= index_topk) -> dense MLA + indexer-key
+        write only; else the sparse path. The dense branch returns -1 top-k placeholders of the
+        sparse branch's shapes (shared layers take the same branch: same condition)."""
+        args = (q, q_rope, new_kv_c, new_k_pe, kv_cache, idx_cache, q_idx, k_idx, idx_weights,
+                dsa_topk_in, dsa_topk_pages_in)
+
+        def sparse(a):
+            o, c = self._decode_sparse(
+                a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], is_full, layer_id, a[9],
+                a[10], dsa_topk_reuse, sm_scale, dpa, md,
+            )
+            return o, c.kv, c.idx, c.topk, c.topk_pages
+
+        shapes = jax.eval_shape(sparse, args)
+
+        def dense(a):
+            o, kv = self._run_dense(a[0], a[1], a[2], a[3], a[4], sm_scale, layer, dpa, md)
+            idx, _, _ = self._maybe_index(
+                is_full, a[6], a[7], a[8], a[5], dpa, md, compute_topk=False, compute_pages=False
+            )
+            # -1 placeholders in the token placement of the sparse branch's top-k
+            topk = None if shapes[3] is None else _like_rows(a[2], shapes[3])
+            pages = None if shapes[4] is None else _like_rows(a[2], shapes[4])
+            return o.astype(shapes[0].dtype), kv, idx, topk, pages
+
+        short = jnp.max(md.seq_lens) <= self.index_topk
+        o, kv, idx, topk, pages = jax.lax.cond(short, dense, sparse, args)
+        return o, DSAFusedCache(kv=kv, idx=idx, topk=topk, topk_pages=pages)
+
+    def _decode_sparse(
+        self, q, q_rope, new_kv_c, new_k_pe, kv_cache, idx_cache, q_idx, k_idx, idx_weights,
+        is_full, layer_id, dsa_topk_in, dsa_topk_pages_in, dsa_topk_reuse, sm_scale, dpa, md,
+    ):
         # ── indexer top-k (full) or reuse (shared / MTP IndexShare) ────────
         reuse_topk = is_full and dsa_topk_reuse and dsa_topk_in is not None
         idx_cache, topk, topk_pages = self._maybe_index(
@@ -1573,6 +1627,15 @@ def _pad_topk_pages(topk_pages: jax.Array, width: int) -> jax.Array:
     if k >= width:
         return topk_pages
     return jnp.pad(topk_pages, ((0, 0), (0, width - k)), constant_values=-1)
+
+
+def _like_rows(rows: jax.Array, sd) -> jax.Array:
+    """All -1 array of ``sd``'s shape/dtype, built from the data-sharded ``rows`` [T, ...] so
+    it carries the token placement (a fresh jnp.full would be replicated)."""
+    if sd.shape[0] != rows.shape[0]:
+        return jnp.full(sd.shape, -1, sd.dtype)
+    base = jnp.zeros_like(rows[:, :1], dtype=sd.dtype) - 1  # [T, 1]
+    return jnp.broadcast_to(base, (rows.shape[0],) + tuple(sd.shape[1:]))
 
 
 def _placeholder_topk_like(topk_pages: jax.Array) -> jax.Array:
