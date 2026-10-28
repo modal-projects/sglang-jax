@@ -148,3 +148,27 @@ def test_same_backend_target_reuses_draft_metadata(mesh):
     worker, mwb, draft_md, template, _ = _setup(mesh)
     worker.target_worker.model_runner.attn_backend = worker._worker.model_runner.attn_backend
     assert worker._target_verify_forward_metadata(mwb, draft_md, template) is draft_md
+
+
+def test_dflash_draft_cell_size_matches_v16_pool(tmp_path):
+    """v16 034f2 (TP16/DP4, attention TP 4): draft pool cell was 6144 bytes/token per chip."""
+    import json
+
+    from sgl_jax.srt.model_executor.model_runner_kv_cache_mixin import ModelRunnerKVCacheMixin
+    from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
+
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {"num_hidden_layers": 6, "num_key_value_heads": 8, "num_attention_heads": 32,
+             "head_dim": 128, "hidden_size": 4096}
+        )
+    )
+    runner = SimpleNamespace(
+        spec_algorithm=SpeculativeAlgorithm.from_string("DFLASH"),
+        server_args=SimpleNamespace(speculative_draft_model_path=str(tmp_path)),
+        attention_tp_size=4,
+        kv_cache_dtype=jnp.bfloat16,
+    )
+    assert ModelRunnerKVCacheMixin._dflash_draft_cell_size(runner) == 6144
+    runner.spec_algorithm = SpeculativeAlgorithm.from_string("NEXTN")
+    assert ModelRunnerKVCacheMixin._dflash_draft_cell_size(runner) == 0
