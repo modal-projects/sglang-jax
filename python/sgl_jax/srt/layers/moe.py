@@ -1111,19 +1111,23 @@ class EPMoE(nnx.Module):
         tok = disp["token_indices"][pos]
         flat = disp["sorted_selected_experts"][pos]  # token * top_k + k
         x = disp["inputs_2d"][tok].astype(self.dtype)
-        out = self._gmm_compute(
-            x,
-            slot,
-            local_gs,
-            w0_weights,
-            w1_weights,
-            wo_weights,
-            jnp.asarray(0, jnp.int32),
-            w0_kernel_scale,
-            w1_kernel_scale,
-            wo_kernel_scale,
-            x_gathered=x,
-        )
+        from sgl_jax.srt.kernels.gmm.megablox_gmm_kernel.gmm_v2 import fp4_rows_per_expert_hint
+
+        rows_hint = disp["inputs_2d"].shape[0] * self.num_experts_per_tok / self.num_experts
+        with fp4_rows_per_expert_hint(rows_hint):
+            out = self._gmm_compute(
+                x,
+                slot,
+                local_gs,
+                w0_weights,
+                w1_weights,
+                wo_weights,
+                jnp.asarray(0, jnp.int32),
+                w0_kernel_scale,
+                w1_kernel_scale,
+                wo_kernel_scale,
+                x_gathered=x,
+            )
         w = jnp.reshape(topk_weights, (-1,)).astype(jnp.float32)[flat]
         contrib = jnp.where(valid[:, None], out.astype(jnp.float32) * w[:, None], 0.0)
         tokens = disp["inputs_2d"].shape[0]
