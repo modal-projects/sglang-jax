@@ -168,6 +168,13 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
 
         draft_server_args = copy.deepcopy(server_args)
         draft_server_args.skip_tokenizer_init = True
+        # The draft shares the target's token allocator (below), so its KV pool must be indexed
+        # by the target's slots. A hybrid SWA pool (sliding-window drafts such as the GLM-5.3
+        # DFlash2 draft) remaps full -> SWA slots through a mapping that only the draft's own
+        # SWATokenToKVPoolAllocator updates; that allocator is never used, so every draft KV
+        # read/write would land in SWA slot 0 (no context for the draft -> acceptance ~1).
+        # A plain pool of the same size keeps the window in the attention kernel instead.
+        draft_server_args.disable_hybrid_swa_memory = True
 
         self._worker = ModelWorker(
             server_args=draft_server_args,
