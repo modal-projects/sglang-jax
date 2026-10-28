@@ -107,6 +107,10 @@ _INDEXER_KERNEL_PREFILL = os.environ.get("DSA_INDEXER_KERNEL_PREFILL", "0") == "
 # bkv block of 64 pages (4K tokens @ page 64) benched fastest across
 # B=8..64, ctx 8K..128K on v7x/v6e.
 _INDEXER_KERNEL_KV_PAGES_PER_BLOCK = 64
+# Opt-in: split the decode KPool indexer's requests across the tensor axis (each rank scores
+# 1/tp of the rows, pmax merges). v6e-16 EP16 c128 spends ~11 ms/step in the live-indexer
+# loop that every tensor rank runs for all requests.
+_INDEXER_TP_SPLIT = os.environ.get("SGLJAX_DSA_INDEXER_TP_SPLIT", "0") == "1"
 
 # Opt-in: run EXTEND/prefill through the fused sparse-MLA prefill kernel
 # (``sparse_mla_prefill.sparse_mla_attention``) at page granularity instead of the
@@ -696,11 +700,21 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                 jnp.full((q_.shape[0], 1), -1, jnp.int32),
             )
         k_pools = self.index_topk // kp
+        live_lens = seq_lens_
+        tp = jax.lax.axis_size("tensor") if _INDEXER_TP_SPLIT else 1
+        if tp > 1:
+            # Every tensor rank holds all heads and all requests of its DP group, so the
+            # indexer was computed tp times redundantly. Each rank scores only its rows
+            # (row % tp == rank; inactive rows are skipped by the live loop) and a pmax
+            # merges them: unowned rows stay -1, owned entries are >= -1.
+            rows = jnp.arange(seq_lens_.shape[0], dtype=jnp.int32)
+            mine = (rows % tp) == jax.lax.axis_index("tensor")
+            live_lens = jnp.where(mine, seq_lens_, 0)
         pools = streamindex_topk_live(
             q_,
             w_,
             blocks,
-            seq_lens_,
+            live_lens,
             pi_ * bpp,
             cuq_,
             cukv_,
@@ -709,6 +723,8 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             pages_per_seq=pages_per_seq,
             compression_ratio=kp,
         )
+        if tp > 1:
+            pools = jax.lax.pmax(pools, "tensor")
         # Decode metadata: query t is (virtual) sequence t, at position seq_lens[t] - 1.
         topk = _kpool_expand(
             pools, seq_lens_[: q_.shape[0]] - 1, kpool=kp, k_tokens=self.index_topk
