@@ -33,7 +33,7 @@ def _run(env, x, w, s, gs, off):
     try:
         jax.clear_caches()
         out = g2.gmm_v2(x, w, gs, rhs_scale=s, group_offset=off, preferred_element_type=jnp.bfloat16,
-                        acc_dtype=jnp.float32, maybe_quantize_lhs=False, rhs_fp4_packed=True,
+                        acc_dtype=jnp.float32, maybe_quantize_lhs=False, rhs_fp4_packed=True, zero_initialize=False,
                         interpret=pltpu.InterpretParams(uninitialized_memory="zero"))
         return np.asarray(out.astype(jnp.float32))
     finally:
@@ -44,7 +44,7 @@ def _run(env, x, w, s, gs, off):
                 os.environ[k] = v
 
 
-@pytest.mark.parametrize("sizes", [(5, 0, 20, 40, 3, 0), (1, 2, 3, 4, 5, 6)])
+@pytest.mark.parametrize("sizes", [(5, 0, 20, 40, 3, 12), (1, 2, 3, 4, 5, 1)])
 def test_decode_tile_m(sizes):
     _patch_tpu_info()
     from sgl_jax.srt.utils.quantization.mxfp4 import packed_fp4_to_dense
