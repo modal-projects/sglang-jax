@@ -41,6 +41,8 @@ from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 
 logger = logging.getLogger(__name__)
 
+_DFLASH_NAN_DEBUG = os.getenv("SGL_JAX_DFLASH_NAN_DEBUG", "0") == "1"
+
 
 def _prepare_model_state(runner, leaves):
     """Apply the attention backend's in-JIT weight preparation, if any."""
@@ -335,6 +337,8 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         ) = self._run_jit_target_verify(
             plan,
         )
+        if _DFLASH_NAN_DEBUG:
+            self._debug_verify_nans(plan, logits_output, accept_lens_out)
 
         next_draft_input = DFlashDraftInput(
             verified_id=new_verified_id,
@@ -737,6 +741,36 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             allocated_lens=draft_plan.allocated_lens,
             relay_future_indices=draft_plan.relay_future_indices,
             relay_valid_mask=draft_plan.relay_valid_mask,
+        )
+
+    def _debug_verify_nans(self, plan, logits_output, accept_lens):
+        """SGL_JAX_DFLASH_NAN_DEBUG=1: log rows whose verify logits / hidden are non-finite (syncs)."""
+        logits = logits_output.next_token_logits
+        hidden = logits_output.hidden_states
+        bad_l = np.asarray(jax.device_get(jnp.any(~jnp.isfinite(logits), axis=-1)))
+        bad_h = (
+            np.asarray(jax.device_get(jnp.any(~jnp.isfinite(hidden), axis=-1)))
+            if hidden is not None
+            else np.zeros_like(bad_l)
+        )
+        self._nan_debug_step = getattr(self, "_nan_debug_step", 0) + 1
+        if not (bad_l.any() or bad_h.any()):
+            return
+        T = self.block_size
+        active = np.asarray(jax.device_get(plan.active_mask))
+        prefix = np.asarray(plan.target_prefix_lens)
+        rows_l = np.flatnonzero(bad_l)
+        rows_h = np.flatnonzero(bad_h)
+        logger.warning(
+            "[DFLASH NAN] step=%d bs=%d active=%s prefix=%s accept=%s bad_logit_rows=%s "
+            "bad_hidden_rows=%s (row//T = slot)",
+            self._nan_debug_step,
+            len(prefix),
+            np.flatnonzero(active).tolist(),
+            prefix.tolist(),
+            np.asarray(jax.device_get(accept_lens)).tolist(),
+            rows_l[:64].tolist(),
+            rows_h[:64].tolist(),
         )
 
     def _target_verify_forward_metadata(self, draft_mwb, draft_metadata, template):
