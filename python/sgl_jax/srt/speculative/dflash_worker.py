@@ -38,6 +38,7 @@ from sgl_jax.srt.speculative.relay_buffer import (
     update_dflash_relay_buffers,
 )
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
+from sgl_jax.srt.speculative.overlap_utils import to_host
 
 logger = logging.getLogger(__name__)
 
@@ -412,11 +413,8 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         if not isinstance(plan, TargetVerifyPlan):
             raise RuntimeError("DFLASH draft extend is missing its target verify plan.")
 
-        accept_lens, verified_id = jax.device_get(
-            (next_draft_input.ctx_lens, next_draft_input.verified_id)
-        )
-        accept_lens = np.asarray(accept_lens, dtype=np.int32)
-        verified_id = np.asarray(verified_id, dtype=np.int32)
+        accept_lens = to_host(next_draft_input.ctx_lens).astype(np.int32)
+        verified_id = to_host(next_draft_input.verified_id).astype(np.int32)
         next_draft_input.verified_id = verified_id
         next_draft_input.ctx_lens = np.zeros_like(accept_lens)
         next_draft_input.draft_seq_lens = plan.target_prefix_lens + accept_lens
