@@ -54,7 +54,7 @@ def _setup(mesh):
         block_size=T,
         mesh=mesh,
         _verify_bucket_templates={},
-        target_worker=SimpleNamespace(model_runner=SimpleNamespace(attn_backend=target)),
+        _target_worker=SimpleNamespace(model_runner=SimpleNamespace(attn_backend=target)),
         _worker=SimpleNamespace(model_runner=SimpleNamespace(attn_backend=draft_backend)),
     )
     # rank 1 has one live request, the rest two.
