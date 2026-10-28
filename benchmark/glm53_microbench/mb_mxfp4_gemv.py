@@ -160,6 +160,8 @@ def dequant_expert(fmt, w, s):
         nc = k8 // 8
         wr = w.reshape(nc, 8, n)
         lo = jnp.stack([(wr >> (8 * b)) & 0xF for b in range(4)], axis=2).reshape(nc, 32, n)
+        if os.environ.get("SGLJAX_FP4_PACK", "v1") == "v2":  # low nibble q<<1 | s
+            lo = ((lo & 1) << 3) | (lo >> 1)
         hi = jnp.stack([(wr >> (8 * b + 4)) & 0xF for b in range(4)], axis=2).reshape(nc, 32, n)
         codes = jnp.concatenate([lo, hi], axis=1).reshape(k8 * 8, n)
         sc = jnp.repeat(s.astype(jnp.float32), 32, axis=0) * 2.0**-14
@@ -280,10 +282,13 @@ def main():
             for path in paths:
                 if is_fp4(fmt):
                     # "scalew": decode tiles with the weight-scaled full-K matmul (SGLJAX_FP4_DECODE_SCALEW)
-                    os.environ["SGLJAX_FP4_PATH"] = "decode" if path in ("scalew", "bits", "dec16", "dec8") else path
-                    os.environ["SGLJAX_FP4_DECODE_SCALEW"] = {"scalew": "1", "bits": "2"}.get(path, "0")
+                    # "<path>v2": the same path with the v2 nibble packing (SGLJAX_FP4_PACK=v2)
+                    base = path[:-2] if path.endswith("v2") else path
+                    os.environ["SGLJAX_FP4_PACK"] = "v2" if base != path else "v1"
+                    os.environ["SGLJAX_FP4_PATH"] = "decode" if base in ("scalew", "bits", "dec16", "dec8") else base
+                    os.environ["SGLJAX_FP4_DECODE_SCALEW"] = {"scalew": "1", "bits": "2"}.get(base, "0")
                     # "dec16": the K32 decode path with 16-row tiles (SGLJAX_FP4_DECODE_TILE_M)
-                    os.environ["SGLJAX_FP4_DECODE_TILE_M"] = {"dec16": "16", "dec8": "8"}.get(path, "32")
+                    os.environ["SGLJAX_FP4_DECODE_TILE_M"] = {"dec16": "16", "dec8": "8"}.get(base, "32")
                     jax.clear_caches()  # the path is chosen at trace time
                 for m in ms:
                     rows = m * TOPK
@@ -319,7 +324,7 @@ def main():
                             except Exception as e:  # noqa: BLE001
                                 case["path_error"] = str(e)[:300]
                             finally:
-                                os.environ["SGLJAX_FP4_PATH"] = "decode" if path in ("scalew", "bits", "dec16", "dec8") else path
+                                os.environ["SGLJAX_FP4_PATH"] = "decode" if base in ("scalew", "bits", "dec16", "dec8") else base
                         if mode == "aot":
                             state = (SD((rows, H), jnp.bfloat16), SD((e_total,), jnp.int32),
                                      SD((1,), jnp.int32))
@@ -356,6 +361,7 @@ def main():
             os.environ.pop("SGLJAX_FP4_PATH", None)
             os.environ.pop("SGLJAX_FP4_DECODE_SCALEW", None)
             os.environ.pop("SGLJAX_FP4_DECODE_TILE_M", None)
+            os.environ.pop("SGLJAX_FP4_PACK", None)
             del consts, w1, s1, w2, s2
             if not fused:
                 del wg, sg, wu, su

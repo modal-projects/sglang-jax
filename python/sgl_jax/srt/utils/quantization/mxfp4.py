@@ -37,6 +37,16 @@ FP4_PACK_CHUNK = 64
 FP4_PACKED_SCALE_EXP = 14
 
 
+def fp4_pack_v2() -> bool:
+    """SGLJAX_FP4_PACK=v2: low-nibble layout q<<1 | s (see gmm_v2.fp4_pack_v2; must match it)."""
+    import os
+
+    v = os.environ.get("SGLJAX_FP4_PACK", "v1")
+    if v not in ("v1", "v2"):
+        raise ValueError(f"SGLJAX_FP4_PACK must be v1 or v2, got {v!r}")
+    return v == "v2"
+
+
 def _check(packed: np.ndarray, codes: np.ndarray, key: str) -> tuple[np.ndarray, np.ndarray]:
     packed = np.ascontiguousarray(packed).view(np.uint8)
     codes = np.ascontiguousarray(codes).view(np.uint8)
@@ -101,7 +111,10 @@ def mxfp4_pair_to_packed_fp4(
     if k % FP4_PACK_CHUNK:
         raise ValueError(f"{key}: K={k} is not a multiple of {FP4_PACK_CHUNK}")
     nib = unpack_e2m1_codes(packed).T.reshape(k // 64, 2, 8, 4, n)  # [chunk, half, j, b, n]
-    byte = nib[:, 0] | (nib[:, 1] << np.uint8(4))  # [chunk, j, b, n] uint8
+    lo = nib[:, 0]
+    if fp4_pack_v2():  # low nibble s|q -> q<<1 | s (gmm_v2.fp4_pack_v2)
+        lo = ((lo & np.uint8(7)) << np.uint8(1)) | (lo >> np.uint8(3))
+    byte = lo | (nib[:, 1] << np.uint8(4))  # [chunk, j, b, n] uint8
     # little-endian host (asserted): byte b of each word is bits 8b..8b+7
     assert sys.byteorder == "little"
     words = np.ascontiguousarray(byte.transpose(0, 1, 3, 2)).view(np.uint32)[..., 0]
@@ -121,7 +134,10 @@ def packed_fp4_to_dense(words: np.ndarray, scale: np.ndarray) -> np.ndarray:
     out = np.empty((k // 64, 2, 8, 4, n), np.uint8)
     for b in range(4):
         byte = (w >> np.uint32(8 * b)) & np.uint32(0xFF)
-        out[:, 0, :, b, :] = byte & 0xF
+        lo = byte & 0xF
+        if fp4_pack_v2():
+            lo = ((lo & 1) << 3) | (lo >> 1)
+        out[:, 0, :, b, :] = lo
         out[:, 1, :, b, :] = byte >> 4
     vals = FP4_E2M1_VALUES[out.reshape(k, n)]
     sc = np.repeat(np.asarray(scale, np.float32), MXFP4_GROUP, axis=0)

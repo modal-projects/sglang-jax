@@ -142,6 +142,18 @@ def fp4_decode_tile_m(dims) -> int:
     return tm
 
 
+def fp4_pack_v2() -> bool:
+    """SGLJAX_FP4_PACK=v2 (read at load AND trace time; both must agree): the LOW nibble of each
+    byte stores E2M1 code s|q (q = ee|m) as q<<1 | s instead of s<<3 | q (the high nibble is
+    unchanged). Then E5M2 bytes are lo = (w & 0x0E) | (w & 0x01) << 7, hi = (w & 0x80) |
+    (w >> 3) & 0x0E: 8 VPU ops per packed word instead of 13 (v6e LLO: decode tm16 985 -> 864
+    bundles per 1M weights). Host side: mxfp4.mxfp4_pair_to_packed_fp4."""
+    v = os.environ.get("SGLJAX_FP4_PACK", "v1")
+    if v not in ("v1", "v2"):
+        raise ValueError(f"SGLJAX_FP4_PACK must be v1 or v2, got {v!r}")
+    return v == "v2"
+
+
 def expand_fp4_packed_e5m2(words: jax.Array) -> jax.Array:
     """Packed E2M1 -> E5M2, exactly, with SWAR mask/shift (4 values per 32-bit op).
 
@@ -152,6 +164,13 @@ def expand_fp4_packed_e5m2(words: jax.Array) -> jax.Array:
     """
     tk8, tn = words.shape
     nc = tk8 // 8
+    if fp4_pack_v2():
+        # v2 nibbles (see fp4_pack_v2): 8 ops/word instead of 13
+        lo = (words & jnp.uint32(0x0E0E0E0E)) | ((words & jnp.uint32(0x01010101)) << 7)
+        hi = (words & jnp.uint32(0x80808080)) | ((words >> 3) & jnp.uint32(0x0E0E0E0E))
+        lo = pltpu.bitcast(lo, jnp.float8_e5m2).reshape(nc, 32, tn)
+        hi = pltpu.bitcast(hi, jnp.float8_e5m2).reshape(nc, 32, tn)
+        return jnp.concatenate([lo, hi], axis=1).reshape(nc * FP4_PACK_CHUNK, tn)
     def to_e5m2(x):
         b = ((x & jnp.uint32(0x08080808)) << 4) | ((x & jnp.uint32(0x07070707)) << 1)
         return pltpu.bitcast(b, jnp.float8_e5m2).reshape(nc, 32, tn)
