@@ -61,3 +61,41 @@ def make_jitted_run_model(attn_backend, compiler_options=None):
             return model(forward_batch, memory_pools, logits_metadata)
 
     return jitted_run_model
+
+
+def make_jitted_dflash_verify(attn_backend, draft_token_num, compiler_options=None):
+    """AOT stand-in for DFlashWorker's target-verify jit (no relay update): the target forward
+    over the [seed, d1..d_{T-1}] rows, greedy acceptance, and the recurrent-state commit at
+    the accepted position for hybrid (KDA) targets."""
+    from sgl_jax.srt.layers.attention.linear.kda_backend import commit_recurrent_verify
+    from sgl_jax.srt.speculative.dflash_info import dflash_greedy_verify
+
+    @partial(
+        jax.jit,
+        donate_argnames=["memory_pools"],
+        static_argnames=["model_state_def"],
+        compiler_options=compiler_options,
+    )
+    def jitted_dflash_verify(
+        model_def,
+        model_state_def,
+        model_state_leaves,
+        forward_batch,
+        memory_pools,
+        logits_metadata,
+    ):
+        prepare_model_state = getattr(attn_backend, "prepare_model_state", None)
+        if prepare_model_state is not None:
+            model_state_leaves = prepare_model_state(model_state_leaves)
+        model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
+        model = nnx.merge(model_def, model_state)
+        memory_pools = _maybe_apply_recurrent_cow(forward_batch, memory_pools)
+        with LoraBatchContext.set_batch(forward_batch):
+            output, pool_updates, _, topk = model(forward_batch, memory_pools, logits_metadata)
+        accept_lens, next_ids, verified, _ = dflash_greedy_verify(
+            forward_batch.input_ids, output.next_token_logits, draft_token_num=draft_token_num
+        )
+        pool_updates = commit_recurrent_verify(pool_updates, accept_lens + 1)
+        return output, pool_updates, accept_lens, next_ids, verified
+
+    return jitted_dflash_verify

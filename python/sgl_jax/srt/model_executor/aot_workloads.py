@@ -240,9 +240,17 @@ class SpeculativeInputBuilder(WorkloadInputBuilder):
     capture_hidden_mode = CaptureHiddenMode.FULL
 
     def _metadata(self, context):
-        if not isinstance(context.backend, FlashAttention):
+        full_backend = context.backend
+        if isinstance(full_backend, HybridLinearAttnBackend):
+            full_backend = full_backend.full_attn_backend
+        mla_verify = (
+            isinstance(full_backend, MLAAttentionBackend)
+            and self.forward_mode == ForwardMode.TARGET_VERIFY
+        )
+        if not (isinstance(context.backend, FlashAttention) or mla_verify):
             raise ValueError(
-                "Speculative export requires the FlashAttention speculative metadata interface"
+                "Speculative export requires the FlashAttention speculative metadata interface "
+                "(MLA/DSA and hybrid KDA+DSA targets: target-verify only)"
             )
         spec = self.spec
         pages_per_request = -(-spec.context_length // spec.page_size)

@@ -1,6 +1,7 @@
 """Build offline inputs through the serving config, model registry and loaders."""
 
 import json
+import os
 import tempfile
 from pathlib import Path
 
@@ -195,6 +196,12 @@ class AbstractModel:
             self.memory_pools,
             inputs.logits,
         )
+        if options.workload == "target-verify" and os.environ.get("SGL_JAX_AOT_DFLASH_VERIFY") == "1":
+            # The DFlash serving verify jit: target forward + greedy acceptance + KDA commit.
+            from sgl_jax.srt.model_executor.model_forward import make_jitted_dflash_verify
+
+            fn = make_jitted_dflash_verify(backend, builder.spec.tokens_per_request)
+            return fn, args, self.model_config.hf_config, builder.spec
         return make_jitted_run_model(backend), args, self.model_config.hf_config, builder.spec
 
 

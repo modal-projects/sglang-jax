@@ -1836,6 +1836,19 @@ class ScheduleBatch:
             per_rank_spec = self._split_spec_info_per_rank(flat_spec, real_bs_per_dp)
             for r, s in enumerate(per_rank_spec):
                 self.reqs_info[r].spec_info = s
+            if self.is_hybrid_recurrent:
+                # Spec decode skips the per-rank loop below, which is where plain decode refreshes
+                # the recurrent slots. Without this, a rank keeps the slots of its last extend
+                # (wrong length / wrong requests after a merge or filter): the KDA verify would
+                # read and commit other requests' state.
+                for info in self.reqs_info:
+                    if info.reqs:
+                        info.recurrent_indices = self.req_to_token_pool.get_linear_recurrent_indices(
+                            info.req_pool_indices
+                        )
+                        info.recurrent_cow_src_indices = None
+                    else:
+                        info.recurrent_indices = None
             return
 
         # Process each DP rank

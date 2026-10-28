@@ -70,6 +70,9 @@ class DraftForwardPlan:
     use_relay_state: bool
     dp_size: int
     bs: int
+    # Metadata for the TARGET attention backend. Equals forward_metadata when the target and
+    # the draft share a backend type; differs for hybrid/MLA targets (GLM-5.3: KDA + DSA).
+    target_forward_metadata: object = None
 
 
 @dataclass(frozen=True)
@@ -648,9 +651,11 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         )
         relay_future_indices = np.where(active_mask, relay_future_indices, 0)
         data_sharding = NamedSharding(self.mesh, P("data"))
+        target_metadata = self._target_verify_forward_metadata(draft_mwb, metadata, template)
         return DraftForwardPlan(
             forward_batch=forward_batch,
             forward_metadata=metadata,
+            target_forward_metadata=target_metadata,
             seq_lens=np.asarray(model_worker_batch.seq_lens, dtype=np.int32),
             target_prefix_lens=np.asarray(target_prefix_lens, dtype=np.int32),
             positions_host=positions_flat,
@@ -710,7 +715,11 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         return TargetVerifyPlan(
             model_worker_batch=target_mwb,
             forward_batch=target_forward_batch,
-            forward_metadata=draft_plan.forward_metadata,
+            forward_metadata=(
+                draft_plan.target_forward_metadata
+                if draft_plan.target_forward_metadata is not None
+                else draft_plan.forward_metadata
+            ),
             logits_metadata=LogitsMetadata.from_model_worker_batch(target_mwb, self.mesh),
             seq_lens=draft_plan.seq_lens,
             target_prefix_lens=draft_plan.target_prefix_lens,
@@ -721,6 +730,64 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             allocated_lens=draft_plan.allocated_lens,
             relay_future_indices=draft_plan.relay_future_indices,
             relay_valid_mask=draft_plan.relay_valid_mask,
+        )
+
+    def _target_verify_forward_metadata(self, draft_mwb, draft_metadata, template):
+        """TARGET_VERIFY metadata for the target's attention backend.
+
+        The draft block and the target verify cover the same [prefix, prefix + T) rows over the
+        same req_to_token pages, so a target that uses the draft's backend type reuses the draft
+        metadata. A hybrid target (GLM-5.3: KDA linear layers + DSA/MLA full layers, draft on
+        ``fa``) needs its own pytree types: MLA metadata over the same full-pool page ids, and
+        linear-recurrent metadata (block-aligned cu_q_lens, recurrent slots, has_initial_state).
+        """
+        backend = self.target_worker.model_runner.attn_backend
+        return self._verify_metadata_for_backend(backend, draft_mwb, draft_metadata, template)
+
+    def _verify_metadata_for_backend(self, backend, draft_mwb, draft_metadata, template):
+        from sgl_jax.srt.layers.attention.flashattention_backend import FlashAttention
+        from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
+            HybridLinearAttnBackend,
+            HybridLinearAttnBackendMetadata,
+        )
+        from sgl_jax.srt.layers.attention.mla_backend import (
+            MLAAttentionBackend,
+            MLAAttentionMetadata,
+        )
+
+        if isinstance(backend, HybridLinearAttnBackend):
+            return HybridLinearAttnBackendMetadata(
+                full_attn_metadata=self._verify_metadata_for_backend(
+                    backend.full_attn_backend, draft_mwb, draft_metadata, template
+                ),
+                linear_attn_metadata=backend.linear_attn_backend.get_forward_metadata(draft_mwb),
+            )
+        if isinstance(backend, MLAAttentionBackend):
+            from jax.sharding import NamedSharding
+            from jax.sharding import PartitionSpec as P
+
+            md = MLAAttentionMetadata()
+            md.cu_q_lens = draft_metadata.cu_q_lens
+            md.cu_kv_lens = draft_metadata.cu_kv_lens
+            md.page_indices = draft_metadata.page_indices
+            md.seq_lens = draft_metadata.seq_lens
+            # MLA kernel distribution for multi-token rows: [0, 0, n] per DP rank
+            # (FA's verify layout is [0, n, n]).
+            dp_size = int(getattr(draft_mwb, "dp_size", 1))
+            local_n = (template.extend_seq_lens > 0).reshape(dp_size, -1).sum(
+                axis=1, dtype=np.int32
+            )
+            dist = np.column_stack(
+                [np.zeros_like(local_n), np.zeros_like(local_n), local_n]
+            ).reshape(-1)
+            md.distribution = jax.device_put(dist, NamedSharding(self.mesh, P("data")))
+            return md
+        if isinstance(backend, FlashAttention) or type(backend) is type(
+            self.draft_model_runner.attn_backend
+        ):
+            return draft_metadata
+        raise NotImplementedError(
+            f"DFLASH target verify has no metadata builder for {type(backend).__name__}"
         )
 
     def _make_draft_block_mwb(
@@ -1695,6 +1762,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             distribution=template.distribution,
         )
         self.draft_model_runner.attn_backend.forward_metadata = draft_metadata
+        target_metadata = self._target_verify_forward_metadata(draft_batch, draft_metadata, template)
         from jax.sharding import NamedSharding
         from jax.sharding import PartitionSpec as P
 
@@ -1761,7 +1829,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         target_plan = TargetVerifyPlan(
             model_worker_batch=target_batch,
             forward_batch=target_forward_batch,
-            forward_metadata=draft_metadata,
+            forward_metadata=target_metadata,
             logits_metadata=LogitsMetadata.from_model_worker_batch(target_batch, self.mesh),
             seq_lens=np.asarray(target_batch.seq_lens, dtype=np.int32) + 1,
             target_prefix_lens=np.asarray(target_batch.seq_lens, dtype=np.int32),
@@ -1774,7 +1842,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             relay_valid_mask=draft_plan.relay_valid_mask,
             update_relay=use_relay_state,
         )
-        self.target_worker.model_runner.attn_backend.forward_metadata = draft_metadata
+        self.target_worker.model_runner.attn_backend.forward_metadata = target_metadata
         logits_output, _, accept_lens, *_ = self._run_jit_target_verify(target_plan)
         self._run_jit_draft_extend(
             logits_output.hidden_states,
