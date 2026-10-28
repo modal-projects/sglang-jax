@@ -763,6 +763,13 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         )
 
         if isinstance(backend, HybridLinearAttnBackend):
+            ri = getattr(draft_mwb, "recurrent_indices", None)
+            if ri is None or np.ndim(ri) != 1 or len(ri) != len(draft_mwb.seq_lens):
+                raise ValueError(
+                    "DFLASH verify on a hybrid recurrent target needs 1-D recurrent_indices per "
+                    f"padded slot; got {None if ri is None else np.shape(ri)} for "
+                    f"{len(draft_mwb.seq_lens)} slots."
+                )
             return HybridLinearAttnBackendMetadata(
                 full_attn_metadata=self._verify_metadata_for_backend(
                     backend.full_attn_backend, draft_mwb, draft_metadata, template

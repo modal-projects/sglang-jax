@@ -577,3 +577,31 @@ def test_merge_batch_per_rank_spec_info(bs_self, bs_other):
         assert spec is not None, f"rank {r}: expected spec_info, got None"
         got = list(np.asarray(spec.verified_id))
         assert got == want, f"rank {r}: verified_id {got} != expected {want}"
+
+
+@pytest.mark.parametrize("dp,bs_per_rank", [(1, [1]), (4, [1, 0, 1, 0]), (4, [2, 1, 0, 3])])
+def test_dflash_decode_mwb_carries_recurrent_slots(dp, bs_per_rank):
+    """Hybrid (KDA) targets: the spec-decode mwb must carry per-slot recurrent indices and
+    has_initial_state (v16 034f9d crashed in KDA verify when they were None)."""
+    from sgl_jax.srt.speculative.dflash_info import DFlashDraftInput
+
+    sb = _mk_batch(dp, bs_per_rank)
+    sb.spec_algorithm = SpeculativeAlgorithm.DFLASH
+    sb.is_hybrid_recurrent = True
+    sb.enable_overlap = True
+    sb.mesh = None
+    for r, info in enumerate(sb.reqs_info):
+        n = len(info.reqs)
+        info.spec_info = DFlashDraftInput(
+            future_indices=np.arange(n, dtype=np.int32) if n else None, block_size=DRAFT_N
+        ) if n else None
+        info.recurrent_indices = np.arange(1, n + 1, dtype=np.int32) + 10 * r if n else None
+    buckets = [b for b in BS_BUCKETS if b >= dp]
+    mwb = sb._get_spec_decode_mwb_dp(buckets, enable_static_lora=False, draft_token_num=DRAFT_N)
+    per_dp = mwb.per_dp_bs_size
+    assert np.ndim(mwb.recurrent_indices) == 1 and len(mwb.recurrent_indices) == dp * per_dp
+    assert np.ndim(mwb.has_initial_state) == 1 and len(mwb.has_initial_state) == dp * per_dp
+    for r, n in enumerate(bs_per_rank):
+        seg = np.asarray(mwb.recurrent_indices[r * per_dp : (r + 1) * per_dp])
+        np.testing.assert_array_equal(seg[:n], np.arange(1, n + 1) + 10 * r)
+        assert np.all(seg[n:] == 0)

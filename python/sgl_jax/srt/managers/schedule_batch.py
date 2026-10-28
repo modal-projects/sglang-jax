@@ -2896,6 +2896,18 @@ class ScheduleBatch:
             tree_cache=self.tree_cache,
             mrope_positions=None,
         )
+        if getattr(self, "is_hybrid_recurrent", False):
+            # Hybrid (KDA) targets: verify reads and commits each request's recurrent slot.
+            # Without these the KDA backend indexes the state pool with None -> extra dim
+            # (v16 034f9d: short-conv take_along_axis "3 vs. 4" on the first real verify).
+            recurrent_indices_cpu = np.zeros(total_bs, dtype=np.int32)
+            for dp_rank, info in enumerate(self.reqs_info):
+                if info.reqs and info.recurrent_indices is not None:
+                    off = dp_rank * per_dp_bs
+                    recurrent_indices_cpu[off : off + len(info.reqs)] = info.recurrent_indices
+            model_worker_batch.recurrent_indices = recurrent_indices_cpu
+            # Every decode slot already holds state (padding slots read the dummy slot 0).
+            model_worker_batch.has_initial_state = np.ones(total_bs, dtype=np.bool_)
         return model_worker_batch
 
     @staticmethod
