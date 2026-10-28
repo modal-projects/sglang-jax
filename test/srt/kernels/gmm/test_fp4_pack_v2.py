@@ -43,7 +43,7 @@ def test_roundtrip_and_expand(v2):
         e5 = np.asarray(g2.expand_fp4_packed_e5m2(jnp.asarray(words)).astype(jnp.float32))
     finally:
         g2.pltpu.bitcast = orig
-    sc = np.repeat(scale, 32, axis=0) * np.float32(2.0**-14)
+    sc = np.repeat(scale, 32, axis=0)  # carries 2**14; E5M2 bytes carry 2**-14
     np.testing.assert_array_equal(e5 * sc, want)
     # v1 words decode differently (the layouts really differ)
     os.environ["SGLJAX_FP4_PACK"] = "v1"
