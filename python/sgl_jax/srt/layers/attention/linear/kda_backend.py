@@ -183,6 +183,40 @@ def commit_recurrent_verify(pool_updates: dict, num_tokens: jax.Array) -> dict:
     updates["recurrent_state_pool"] = (layers_recurrent, layers_conv)
     return updates
 
+
+# Opt-in (SGLJAX_KDA_CONV_DENSE=1): read/write the per-request conv states with one-hot matmuls over
+# the whole (small) per-chip conv pool instead of an XLA row gather/scatter. The pool is
+# [slots, proj/tp, K-1] (~2.4 MB per layer per chip at 65 slots); XLA:TPU's row scatter costs
+# ~0.3 us per row (v6e-16 DP4 c192: 1.6 ms/step scatter + 0.3 ms gather over 34 KDA layers),
+# while a dense rewrite of the pool is a few us. Exact: every output element has at most one
+# non-zero term (slots are unique per request; idx 0 = padding, never written).
+_CONV_DENSE = os.environ.get("SGLJAX_KDA_CONV_DENSE", "0") == "1"
+
+
+def _prec(dtype):
+    # bf16 x one-hot is exact at DEFAULT; wider state dtypes need the multi-pass f32 MXU path.
+    return None if jnp.dtype(dtype).itemsize <= 2 else jax.lax.Precision.HIGHEST
+
+
+def _dense_rows_get(buf, idx):
+    slots = buf.shape[0]
+    onehot = (idx[:, None] == jnp.arange(slots, dtype=idx.dtype)[None, :]).astype(buf.dtype)
+    flat = buf.reshape(slots, -1)
+    out = jnp.matmul(onehot, flat, preferred_element_type=jnp.float32, precision=_prec(buf.dtype))
+    return out.astype(buf.dtype).reshape((idx.shape[0],) + buf.shape[1:])
+
+
+def _dense_rows_set(buf, idx, val, write):
+    slots = buf.shape[0]
+    hit = (idx[None, :] == jnp.arange(slots, dtype=idx.dtype)[:, None]) & write[None, :]  # [S, B]
+    flat = val.reshape(val.shape[0], -1).astype(buf.dtype)
+    scattered = jnp.matmul(
+        hit.astype(buf.dtype), flat, preferred_element_type=jnp.float32, precision=_prec(buf.dtype)
+    )
+    written = jnp.any(hit, axis=1)
+    out = jnp.where(written[:, None], scattered.astype(buf.dtype), buf.reshape(slots, -1))
+    return out.reshape(buf.shape)
+
 def kda_decode_kernel_choice() -> str:
     """``SGLANG_JAX_KDA_DECODE_KERNEL``: ``pallas`` | ``naive`` | ``auto`` (default).
 
@@ -410,7 +444,7 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
             )(recurrent_buffer, recurrent_indices)
 
         conv = jax.shard_map(
-            lambda buf, idx: buf[idx],
+            _dense_rows_get if _CONV_DENSE else (lambda buf, idx: buf[idx]),
             mesh=self.mesh,
             in_specs=(P("data", "tensor", None), P("data")),
             out_specs=P("data", "tensor", None),
@@ -457,6 +491,8 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         full_conv = conv_buffer_list[0]
 
         def _scatter(buf, idx, val):
+            if _CONV_DENSE:
+                return _dense_rows_set(buf, idx, val, idx != 0)
             keep_mask = (idx == 0).reshape(-1, 1, 1)
             safe_val = jnp.where(keep_mask, buf[idx], val)
             return buf.at[idx].set(safe_val)
