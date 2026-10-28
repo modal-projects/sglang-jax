@@ -280,8 +280,8 @@ def main():
             for path in paths:
                 if is_fp4(fmt):
                     # "scalew": decode tiles with the weight-scaled full-K matmul (SGLJAX_FP4_DECODE_SCALEW)
-                    os.environ["SGLJAX_FP4_PATH"] = "decode" if path == "scalew" else path
-                    os.environ["SGLJAX_FP4_DECODE_SCALEW"] = "1" if path == "scalew" else "0"
+                    os.environ["SGLJAX_FP4_PATH"] = "decode" if path in ("scalew", "bits") else path
+                    os.environ["SGLJAX_FP4_DECODE_SCALEW"] = {"scalew": "1", "bits": "2"}.get(path, "0")
                     jax.clear_caches()  # the path is chosen at trace time
                 for m in ms:
                     rows = m * TOPK
@@ -317,7 +317,7 @@ def main():
                             except Exception as e:  # noqa: BLE001
                                 case["path_error"] = str(e)[:300]
                             finally:
-                                os.environ["SGLJAX_FP4_PATH"] = "decode" if path == "scalew" else path
+                                os.environ["SGLJAX_FP4_PATH"] = "decode" if path in ("scalew", "bits") else path
                         if mode == "aot":
                             state = (SD((rows, H), jnp.bfloat16), SD((e_total,), jnp.int32),
                                      SD((1,), jnp.int32))

@@ -90,7 +90,7 @@ def _fp4_decode_scale_weights() -> bool:
     expanded weights by their power-of-two K32 scales in bf16 (exact) and run ONE full-K matmul,
     instead of tile_k/32 K=32-deep matmuls (each a separate MXU weight push using 1/8 of the
     array) with an f32 rescale-accumulate of the [tile_m, tile_n] output per block."""
-    return os.environ.get("SGLJAX_FP4_DECODE_SCALEW", "0") == "1"
+    return os.environ.get("SGLJAX_FP4_DECODE_SCALEW", "0") in ("1", "2")
 
 
 def fp4_packed_use_full_k(dims) -> bool:
@@ -134,6 +134,59 @@ def expand_fp4_packed_e5m2(words: jax.Array) -> jax.Array:
     lo = to_e5m2(words & jnp.uint32(0x0F0F0F0F))
     hi = to_e5m2((words >> 4) & jnp.uint32(0x0F0F0F0F))
     return jnp.concatenate([lo, hi], axis=1).reshape(nc * FP4_PACK_CHUNK, tn)
+
+
+def _scale_biased_exponent(scale: jax.Array) -> jax.Array:
+    """Biased binary exponent (uint32) of power-of-two scales stored as bf16 or f32."""
+    if scale.dtype == jnp.bfloat16:
+        bits = jax.lax.bitcast_convert_type(scale, jnp.uint16)
+        return (bits.astype(jnp.uint32) >> 7) & jnp.uint32(0xFF)
+    bits = jax.lax.bitcast_convert_type(scale.astype(jnp.float32), jnp.uint32)
+    return (bits >> 23) & jnp.uint32(0xFF)
+
+
+def expand_fp4_packed_bf16_scaled(words: jax.Array, scale: jax.Array) -> jax.Array:
+    """Packed E2M1 x its K32 power-of-two scale -> bf16 [tk, tn], exactly, by bit construction.
+
+    words: uint32 [tk/8, tn] (layout of :func:`expand_fp4_packed_e5m2`); scale: [tk/32, tn] (or
+    [tk/32, 1, tn]) holding 2**(e8m0 - 127 + FP4_PACKED_SCALE_EXP). In a 64-row chunk c the low
+    nibbles are K rows 64c + 4j + b (scale block 2c), the high nibbles rows 64c + 32 + 4j + b
+    (block 2c + 1). For code s|ee|m and scale exponent X: e > 0 -> exponent e - 1 + X + 127,
+    mantissa m << 6; e == 0 -> 0.5 * m (exponent X + 126). The scale is folded in as an
+    exponent add: no E5M2 detour, no multiply. Requires normal results (X >= -125).
+    """
+    tk8, tn = words.shape
+    nc = tk8 // 8
+    sb = _scale_biased_exponent(scale.reshape(nc * 2, tn))  # [tk/32, tn]
+    # unbiased X = sb - 127 - FP4_PACKED_SCALE_EXP; result biased exp = e - 1 + X + 127
+    off = jnp.uint32(1 + FP4_PACKED_SCALE_EXP)
+    sb2 = sb.reshape(nc, 2, tn)
+    # [tk/8, tn]: scale block 2c (low nibbles) / 2c + 1 (high) for packed rows 8c..8c+7
+    s_lo = jnp.broadcast_to(sb2[:, 0:1, :], (nc, 8, tn)).reshape(tk8, tn)
+    s_hi = jnp.broadcast_to(sb2[:, 1:2, :], (nc, 8, tn)).reshape(tk8, tn)
+
+    def build(code, sexp):
+        sign = (code >> 3) & jnp.uint32(1)
+        e = (code >> 1) & jnp.uint32(3)
+        m = code & jnp.uint32(1)
+        exp_n = e + sexp - off  # e > 0
+        exp_s = sexp - off  # e == 0, m == 1: 0.5 * 2**X
+        exp = jnp.where(e > 0, exp_n, exp_s)
+        mant = jnp.where(e > 0, m << 6, jnp.uint32(0))
+        nonzero = (e > 0) | (m > 0)
+        bits = (sign << 15) | jnp.where(nonzero, (exp << 7) | mant, jnp.uint32(0))
+        return bits
+
+    def half(shift0, sexp):
+        # 4 nibbles per word (bytes b = 0..3) -> rows 4j + b of a 32-row half chunk
+        parts = [build((words >> jnp.uint32(shift0 + 8 * b)) & jnp.uint32(0xF), sexp) for b in range(4)]
+        v = jnp.stack(parts, axis=1)  # [tk/8, 4, tn]
+        return v.reshape(nc, 32, tn)
+
+    lo = half(0, s_lo)
+    hi = half(4, s_hi)
+    bits = jnp.concatenate([lo, hi], axis=1).reshape(nc * 64, tn)
+    return jax.lax.bitcast_convert_type(bits.astype(jnp.uint16), jnp.bfloat16)
 
 
 E2M1_DECODE = os.environ.get("SGLJAX_E2M1_DECODE", "bits")
@@ -376,8 +429,18 @@ def inner_kernel(
                 # W4A16 MXFP4, exact: expand packed FP4 to E5M2 in VMEM (v6e's fast FP8 MXU format).
                 assert is_block_rhs_scale and rhs_block == 32 and valid_k == 0
                 tile_k, tile_n = cfgs.tiles.tile_k, cfgs.tiles.tile_n
-                w = expand_fp4_packed_e5m2(tiled_rhs)
-                if cfgs.tiles.tile_m > FP4_PACKED_MAX_TILE_M or _fp4_decode_scale_weights():
+                if os.environ.get("SGLJAX_FP4_DECODE_SCALEW", "0") == "2":
+                    # bf16 built from the nibbles with the K32 scale as an exponent add
+                    w = expand_fp4_packed_bf16_scaled(tiled_rhs, tiled_rhs_ref.scale[...])
+                    acc = jnp.matmul(
+                        tiled_lhs.astype(jnp.bfloat16), w, preferred_element_type=jnp.float32
+                    ).astype(acc_ref.dtype)
+                    w = None
+                else:
+                    w = expand_fp4_packed_e5m2(tiled_rhs)
+                if w is None:
+                    pass
+                elif cfgs.tiles.tile_m > FP4_PACKED_MAX_TILE_M or _fp4_decode_scale_weights():
                     # Prefill: scale the expanded weights in bf16 (exact: power-of-two scale x
                     # E2M1 value) and run one full-K matmul.
                     scale = tiled_rhs_ref.scale[...].astype(jnp.bfloat16)
