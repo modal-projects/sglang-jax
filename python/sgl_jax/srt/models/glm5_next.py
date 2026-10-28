@@ -520,8 +520,6 @@ class Glm5NextForConditionalGeneration(nnx.Module):
     """Serving class for `zai-org/GLM-5.3-Flash` (HF arch `Glm5NextForConditionalGeneration`)."""
 
     @classmethod
-
-    @classmethod
     def get_expert_location_config(cls, hf_config) -> dict:
         """EPLB fields (GLM-5.3 names its routed-expert count n_routed_experts); the per-layer
         maps are indexed by absolute layer id (the first_k_dense_replace dense layers get zero
@@ -532,6 +530,7 @@ class Glm5NextForConditionalGeneration(nnx.Module):
             "num_groups": int(getattr(hf_config, "n_group", 1) or 1),
         }
 
+    @classmethod
     def patch_model_config(cls, config: ModelConfig) -> None:
         from sgl_jax.srt.configs.model_config import AttentionArch
 
