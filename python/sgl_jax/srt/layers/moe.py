@@ -135,6 +135,8 @@ _MOE_FUSED_TILE_M = 32
 # lands on flat device e, whose data index is e // tensor_size, i.e. exactly its DP group's
 # contiguous token range), so the reshard to P('data') only all-gathers within a DP group.
 _EPMOE_DP_RS = os.environ.get("SGLJAX_EPMOE_DP_RS", "0") == "1"
+_EPMOE_COMPACT = os.environ.get("SGLJAX_EPMOE_COMPACT", "0") == "1"
+_EPMOE_COMPACT_CF = float(os.environ.get("SGLJAX_EPMOE_COMPACT_CF", "2.0"))
 _scatter_expert_depth = 0
 
 
@@ -1040,6 +1042,97 @@ class EPMoE(nnx.Module):
         combine on the SC path) and the tensor/expert reductions. ``combine_pin`` (micro-batch
         PIN=4) adds a zero-valued data edge from a scalar to the combine input so the SparseCore
         combine cannot be scheduled ahead of that scalar's producer."""
+        def full():
+            return self._experts_local_unreduced(
+                disp, topk_weights, w0_weights, w1_weights, wo_weights, w0_kernel_scale,
+                w1_kernel_scale, wo_kernel_scale, w0_kernel_bias, w1_kernel_bias, wo_kernel_bias,
+                combine_pin,
+            )
+
+        r_cap = self._compact_capacity(disp, combine_pin)
+        if r_cap:
+            gs = disp["group_sizes"].astype(jnp.int32)
+            local_count = jnp.sum(
+                jax.lax.dynamic_slice_in_dim(gs, disp["group_offset"], self.experts_per_device)
+            )
+
+            def compact():
+                return self._experts_local_compact(
+                    disp, topk_weights, r_cap, w0_weights, w1_weights, wo_weights,
+                    w0_kernel_scale, w1_kernel_scale, wo_kernel_scale,
+                )
+
+            # Exact: overflow (more local rows than the static capacity) takes the full path.
+            output = jax.lax.cond(local_count <= r_cap, compact, full)
+        else:
+            output = full()
+        return self._reduce_expert_output(output, scatter_on_tensor)
+
+    def _compact_capacity(self, disp, combine_pin) -> int:
+        """Static row capacity of the compact local-expert path (0 = not applicable).
+
+        Opt-in ``SGLJAX_EPMOE_COMPACT=1``: with replicated tokens (TP / DP attention) every chip
+        gathers, GEMMs and unpermutes all T*top_k routed rows although only ~1/ep of them hit its
+        experts. The compact path handles only the rows of the local experts (a contiguous range
+        of the expert-sorted order), padded to a static capacity of
+        ``SGLJAX_EPMOE_COMPACT_CF`` (default 2.0) x the mean local share."""
+        if not _EPMOE_COMPACT or self.ep_size <= 1 or self.tp_size != 1:
+            return 0
+        if combine_pin is not None or disp.get("x_gathered") is not None:
+            return 0
+        if disp.get("local_range") is not None or disp.get("valid_mask") is not None:
+            return 0
+        n = int(disp["token_indices"].shape[0])
+        cap = max(64, math.ceil(_EPMOE_COMPACT_CF * n * self.experts_per_device / self.num_experts))
+        cap = -(-cap // 32) * 32
+        return cap if cap < n else 0
+
+    def _experts_local_compact(
+        self, disp, topk_weights, r_cap, w0_weights, w1_weights, wo_weights,
+        w0_kernel_scale, w1_kernel_scale, wo_kernel_scale,
+    ):
+        """Local-expert rows only: [r_cap, H] gather -> local gmm (group_offset 0 over this
+        chip's experts) -> weighted scatter-add into [T, H]. Rows past the local count are
+        padding and are masked out (never multiplied, so garbage cannot leak)."""
+        gs = disp["group_sizes"].astype(jnp.int32)
+        off = disp["group_offset"]
+        local_gs = jax.lax.dynamic_slice_in_dim(gs, off, self.experts_per_device)
+        start = jnp.sum(jnp.where(jnp.arange(gs.shape[0]) < off, gs, 0))
+        count = jnp.sum(local_gs)
+        n = disp["token_indices"].shape[0]
+        slot = jnp.arange(r_cap, dtype=jnp.int32)
+        valid = slot < count
+        pos = jnp.minimum(start + slot, n - 1)
+        tok = disp["token_indices"][pos]
+        flat = disp["sorted_selected_experts"][pos]  # token * top_k + k
+        x = disp["inputs_2d"][tok].astype(self.dtype)
+        out = self._gmm_compute(
+            x,
+            slot,
+            local_gs,
+            w0_weights,
+            w1_weights,
+            wo_weights,
+            jnp.asarray(0, jnp.int32),
+            w0_kernel_scale,
+            w1_kernel_scale,
+            wo_kernel_scale,
+            x_gathered=x,
+        )
+        w = jnp.reshape(topk_weights, (-1,)).astype(jnp.float32)[flat]
+        contrib = jnp.where(valid[:, None], out.astype(jnp.float32) * w[:, None], 0.0)
+        tokens = disp["inputs_2d"].shape[0]
+        # Combine by a one-hot matmul instead of a scatter-add (XLA:TPU's scatter emitter crashes
+        # on this pattern; [tokens, r_cap] x [r_cap, H] is tiny on the MXU, exact at HIGHEST).
+        onehot = (tok[None, :] == jnp.arange(tokens, dtype=tok.dtype)[:, None]).astype(jnp.float32)
+        output = jnp.matmul(onehot, contrib, precision=jax.lax.Precision.HIGHEST)
+        return output.astype(self.dtype)
+
+    def _experts_local_unreduced(
+        self, disp, topk_weights, w0_weights, w1_weights, wo_weights, w0_kernel_scale,
+        w1_kernel_scale, wo_kernel_scale, w0_kernel_bias, w1_kernel_bias, wo_kernel_bias,
+        combine_pin,
+    ):
         intermediate_output = self._gmm_compute(
             disp["inputs_2d"],
             disp["token_indices"],
@@ -1073,7 +1166,7 @@ class EPMoE(nnx.Module):
             valid_mask=disp["valid_mask"],
             inverse=disp.get("permute_inverse"),
         )
-        return self._reduce_expert_output(output, scatter_on_tensor)
+        return output
 
     def _reduce_expert_output(self, output, scatter_on_tensor):
         """Tail of ``_experts_local`` after the combine: tensor-axis RS/AR and the expert-axis reduce."""

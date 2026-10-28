@@ -39,3 +39,33 @@ def test_epmoe_dp_reduce_scatter_matches_psum(monkeypatch):
             outs[flag] = np.asarray(f(x, w, ids), np.float32)
     assert np.abs(outs[True]).max() > 0
     np.testing.assert_allclose(outs[True], outs[False], rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.skipif(len(jax.devices()) < 8, reason="needs 8 (fake) devices")
+@pytest.mark.parametrize("cf", [2.0, 0.5])  # 0.5: capacity below the mean -> overflow fallback
+def test_epmoe_compact_local_rows_matches_full(monkeypatch, cf):
+    mesh = Mesh(np.asarray(jax.devices()[:8]).reshape(4, 2), ("data", "tensor"),
+                axis_types=(AxisType.Explicit,) * 2)
+    H, E, K, I, T = 256, 16, 2, 128, 256
+    with jax.set_mesh(mesh):
+        layer = EPMoE(hidden_size=H, num_experts=E, num_experts_per_tok=K, ep_size=8, mesh=mesh,
+                      intermediate_dim=I, activation="silu_clamp")
+        ks = jax.random.split(jax.random.PRNGKey(1), 6)
+        for name, k in zip(("wi_0", "wi_1", "wo"), ks[:3]):
+            p = getattr(layer, name)
+            p.value = jax.device_put(
+                (jax.random.normal(k, p.value.shape, jnp.float32) * 0.05).astype(jnp.bfloat16),
+                p.value.sharding)
+        x = jax.sharding.reshard(jax.random.normal(ks[3], (T, H), jnp.float32).astype(jnp.bfloat16),
+                                 P("data", None))
+        ids = jax.sharding.reshard(jax.random.randint(ks[4], (T, K), 0, E, jnp.int32), P("data", None))
+        w = jax.sharding.reshard(jax.nn.softmax(jax.random.normal(ks[5], (T, K)), -1), P("data", None))
+        out_sh = NamedSharding(mesh, P("data", None))
+        monkeypatch.setattr(moe_mod, "_EPMOE_COMPACT_CF", cf)
+        outs = {}
+        for flag in (False, True):
+            monkeypatch.setattr(moe_mod, "_EPMOE_COMPACT", flag)
+            f = jax.jit(lambda x, w, i: layer(x, w, i, out_sharding=out_sh))
+            outs[flag] = np.asarray(f(x, w, ids), np.float32)
+    assert np.abs(outs[False]).max() > 0
+    np.testing.assert_allclose(outs[True], outs[False], rtol=2e-2, atol=2e-2)
