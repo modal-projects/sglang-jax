@@ -1195,8 +1195,11 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             next_token_ids_flat = jax.sharding.reshard(next_token_ids_flat, token_sharding)
             new_verified_id = jax.sharding.reshard(new_verified_id, token_sharding)
             # Hybrid linear-attention targets (KDA): verify wrote no recurrent state; commit
-            # each layer's state at the accepted position (seed + accepted drafts).
-            pool_updates = commit_recurrent_verify(pool_updates, accept_lens_out + 1)
+            # each layer's state at the accepted position. dflash_greedy_verify's accept_lens_out
+            # already counts the seed (accepted drafts + 1), the same count new_seq_lens and the
+            # draft-KV mask use. (+1 here committed one rejected draft per step and, at full
+            # acceptance, read past the conv window -> NaN: the v8a 211-223 collapse.)
+            pool_updates = commit_recurrent_verify(pool_updates, accept_lens_out)
             new_seq_lens = (target_prefix_lens + 1 + accept_lens_out).astype(jnp.int32)
             new_seq_lens = jax.sharding.reshard(new_seq_lens, token_sharding)
             updated_relay_buffers = relay_buffers

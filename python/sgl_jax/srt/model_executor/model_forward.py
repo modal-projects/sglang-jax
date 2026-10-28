@@ -95,7 +95,7 @@ def make_jitted_dflash_verify(attn_backend, draft_token_num, compiler_options=No
         accept_lens, next_ids, verified, _ = dflash_greedy_verify(
             forward_batch.input_ids, output.next_token_logits, draft_token_num=draft_token_num
         )
-        pool_updates = commit_recurrent_verify(pool_updates, accept_lens + 1)
+        pool_updates = commit_recurrent_verify(pool_updates, accept_lens)  # seed included
         return output, pool_updates, accept_lens, next_ids, verified
 
     return jitted_dflash_verify

@@ -315,3 +315,23 @@ def test_build_dflash_draft_block():
         np.asarray(positions),
         np.array([[5, 6, 7, 8], [3, 4, 5, 6]], dtype=np.int32),
     )
+
+
+def test_greedy_verify_accept_lens_count_the_seed():
+    """accept_lens_out = accepted drafts + 1 (the seed / bonus position). Callers (new_seq_lens,
+    draft-KV mask, scheduler token slicing, KDA commit) must use it as the committed count as-is;
+    the KDA commit once added another +1 (v8a 211-223: drift, then NaN at full acceptance)."""
+    import jax.numpy as jnp
+    import numpy as np
+
+    from sgl_jax.srt.speculative.dflash_info import dflash_greedy_verify
+
+    T, V = 4, 11
+    draft = jnp.asarray([[5, 1, 2, 3], [7, 1, 9, 9], [0, 4, 4, 4]], jnp.int32).reshape(-1)
+    pred = np.asarray([[1, 2, 3, 6], [2, 0, 0, 0], [4, 4, 4, 8]])  # target argmax per row
+    logits = jnp.asarray(np.eye(V, dtype=np.float32)[pred.reshape(-1)])
+    accept_out, flat, bonus, accept_draft = dflash_greedy_verify(draft, logits, draft_token_num=T)
+    np.testing.assert_array_equal(np.asarray(accept_draft), [3, 0, 3])
+    np.testing.assert_array_equal(np.asarray(accept_out), [4, 1, 4])
+    assert int(np.max(np.asarray(accept_out))) <= T
+    np.testing.assert_array_equal(np.asarray(bonus), [6, 2, 8])

@@ -85,7 +85,8 @@ def commit_kda_verify(record: KDAVerifyRecord, num_tokens: jax.Array):
     mesh = record.mesh
     T = record.k.shape[1]
     W = record.conv0_q.shape[-1]
-    steps = num_tokens.astype(jnp.int32)
+    # Committed tokens per request are in [0, T]; a larger count would read past the conv window.
+    steps = jnp.clip(num_tokens.astype(jnp.int32), 0, T)
 
     def _replay(k, v, g, beta, h0, steps):
         live = jnp.arange(T, dtype=jnp.int32)[None, :] < steps[:, None]  # [B, T]
