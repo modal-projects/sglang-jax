@@ -34,7 +34,15 @@ def test_roundtrip_and_expand(v2):
     want = mxfp4.dequantize_mxfp4(packed, codes).T  # [K, N]
     words, scale = mxfp4.mxfp4_pair_to_packed_fp4(packed, codes)
     np.testing.assert_array_equal(mxfp4.packed_fp4_to_dense(words, scale), want)
-    e5 = np.asarray(g2.expand_fp4_packed_e5m2(jnp.asarray(words)).astype(jnp.float32))
+    import importlib as _il
+
+    _q = _il.import_module("sgl_jax.test.test_mxfp4_quark")
+    orig = g2.pltpu.bitcast
+    try:  # pltpu.bitcast is a Mosaic primitive; on CPU use lax's equivalent (same bits)
+        g2.pltpu.bitcast = lambda x, dt: _q._lax_bitcast(x, dt)
+        e5 = np.asarray(g2.expand_fp4_packed_e5m2(jnp.asarray(words)).astype(jnp.float32))
+    finally:
+        g2.pltpu.bitcast = orig
     sc = np.repeat(scale, 32, axis=0) * np.float32(2.0**-14)
     np.testing.assert_array_equal(e5 * sc, want)
     # v1 words decode differently (the layouts really differ)
