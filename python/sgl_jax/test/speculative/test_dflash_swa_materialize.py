@@ -70,7 +70,22 @@ def mesh():
     )
 
 
-def test_materialize_into_swa_pool_dp4(mesh):
+def _xla_kv_cache_update(new_kv, slices, kv_cache, num_kv_update_slices, page_size, num_slices_per_block):
+    """CPU stand-in for the Pallas paged KV writer (same slot_mapping contract, slice_len 0 or 1)."""
+    del num_kv_update_slices, page_size, num_slices_per_block
+    shape = kv_cache.shape
+    cache = kv_cache.reshape((shape[0] * shape[1],) + shape[2:])
+    new = new_kv.reshape((-1,) + new_kv.shape[2:])
+    dst, src, n = slices[0], slices[1], slices[2]
+    dst = jnp.where(n > 0, dst, cache.shape[0])
+    cache = cache.at[dst].set(new[jnp.clip(src, 0, new.shape[0] - 1)], mode="drop")
+    return cache.reshape(shape)
+
+
+def test_materialize_into_swa_pool_dp4(mesh, monkeypatch):
+    import sgl_jax.srt.mem_cache.memory_pool as mp
+
+    monkeypatch.setattr(mp, "kv_cache_update_impl", _xla_kv_cache_update)
     pool, alloc = _pool(mesh)
     ref_pool, ref_alloc = _pool(mesh)
     rows_per_rank = 16
