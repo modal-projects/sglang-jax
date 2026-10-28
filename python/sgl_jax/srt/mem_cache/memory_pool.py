@@ -1258,11 +1258,14 @@ class SWAKVPool(KVCache):
             tokens_per_rank = loc.shape[0] // self.dp_size
             loc_2d = loc.reshape(self.dp_size, tokens_per_rank)
             # Per-rank gather: each rank's loc indexes into its own mapping
-            remapped = jnp.take_along_axis(stacked, loc_2d.astype(jnp.int64), axis=1)
-            return remapped.reshape(-1).astype(jnp.int32)
+            safe = jnp.maximum(loc_2d, 0).astype(jnp.int64)
+            remapped = jnp.take_along_axis(stacked, safe, axis=1).reshape(-1)
         else:
             # DP=1: simple 1D gather
-            return jnp.asarray(mapping)[loc].astype(jnp.int32)
+            remapped = jnp.asarray(mapping)[jnp.maximum(loc, 0)]
+        # Keep -1 (masked / padding rows) as -1: a negative index would wrap to the mapping's
+        # last entry, a real full-pool slot, and the write would land in some request's SWA row.
+        return jnp.where(loc < 0, -1, remapped).astype(jnp.int32)
 
     def set_kv_buffer(
         self,
