@@ -105,6 +105,11 @@ def fp4_packed_use_full_k(dims) -> bool:
                                  per expert, independent of the EP size)
     """
     path = os.environ.get("SGLJAX_FP4_PATH", "auto")
+    hint = getattr(_FP4_ROWS_HINT, "v", None)
+    if path == "auto" and hint is not None and os.environ.get("SGLJAX_FP4_DECODE_TILE_M") == "auto":
+        # v8b EP8 microbench (decode tm32 vs full-K, us/layer): 28 rows/expert 1174 vs 1255,
+        # 57 rows/expert 2004 vs 1616 -> full-K from ~40 rows/expert (spec verify at high c).
+        return hint >= float(os.environ.get("SGLJAX_FP4_FULLK_MIN_ROWS_HINT", "40"))
     if path not in ("auto", "decode", "fullk"):
         raise ValueError(f"SGLJAX_FP4_PATH must be auto, decode or fullk, got {path!r}")
     if path != "auto":
@@ -116,6 +121,25 @@ def fp4_packed_use_full_k(dims) -> bool:
     groups = dims.size_group if basis == "local" else dims.size_lhs_group
     return dims.size_m >= cutoff * groups
 FP4_PACKED_FULL_K_MAX_TILE_N = 512
+
+
+import contextlib
+import threading
+
+_FP4_ROWS_HINT = threading.local()
+
+
+@contextlib.contextmanager
+def fp4_rows_per_expert_hint(rows_per_expert: float | None):
+    """Trace-time hint from the MoE layer: mean routed rows per expert (global tokens x top-k /
+    experts). The gmm's own shapes cannot tell it under a compact / capacity-padded lhs (size_m is
+    the capacity, not the routed rows), so the auto tile choice reads this when set."""
+    prev = getattr(_FP4_ROWS_HINT, "v", None)
+    _FP4_ROWS_HINT.v = rows_per_expert
+    try:
+        yield
+    finally:
+        _FP4_ROWS_HINT.v = prev
 
 
 def fp4_decode_tile_m(dims) -> int:
@@ -135,7 +159,9 @@ def fp4_decode_tile_m(dims) -> int:
     """
     v = os.environ.get("SGLJAX_FP4_DECODE_TILE_M", "32")
     if v == "auto":
-        return 16 if dims.size_m <= 8 * dims.size_lhs_group else FP4_PACKED_MAX_TILE_M
+        hint = getattr(_FP4_ROWS_HINT, "v", None)
+        rows = hint if hint is not None else dims.size_m / max(dims.size_lhs_group, 1)
+        return 16 if rows <= 10 else FP4_PACKED_MAX_TILE_M
     tm = int(v)
     if tm not in (8, 16, 32):
         raise ValueError(f"SGLJAX_FP4_DECODE_TILE_M must be 8, 16, 32 or auto, got {v!r}")

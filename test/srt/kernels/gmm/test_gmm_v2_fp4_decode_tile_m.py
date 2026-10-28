@@ -67,6 +67,14 @@ def test_decode_tile_m(sizes):
     np.testing.assert_array_equal(o16[lo:hi], o32[lo:hi])
     np.testing.assert_array_equal(oau[lo:hi], o32[lo:hi])
     np.testing.assert_array_equal(o8[lo:hi], o32[lo:hi])
+    # auto + MoE rows-per-expert hint: 5 -> tile 16, 20 -> tile 32, 50 -> full-K path
+    from sgl_jax.srt.kernels.gmm.megablox_gmm_kernel import gmm_v2 as g2
+
+    env = {"SGLJAX_FP4_PATH": "auto", "SGLJAX_FP4_DECODE_TILE_M": "auto"}
+    for hint in (5.0, 20.0, 50.0):
+        with g2.fp4_rows_per_expert_hint(hint):
+            oh = _run(env, *args)
+        np.testing.assert_allclose(oh[lo:hi], o32[lo:hi], rtol=2e-2, atol=2e-2)
     ref = np.zeros((m, N), np.float32)
     r = lo
     for g in range(G):
