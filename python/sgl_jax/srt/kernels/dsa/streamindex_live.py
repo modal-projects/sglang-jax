@@ -8,10 +8,17 @@ context limit. No short-context shortcut is used: every active query is scored.
 
 from __future__ import annotations
 
+import os
+
 import jax
 import jax.numpy as jnp
 
 from sgl_jax.srt.kernels.dsa.streamindex_topk import streamindex_topk
+
+# Requests scored per while-loop iteration (same live-context bucket). Each iteration pays a
+# switch + kernel launch + top-k + scatter (~40 us on v6e); at c128 the loop runs ~24-32 times
+# per full layer. SGLJAX_DSA_LIVE_GROUP raises it (A/B; default 4).
+_GROUP_SIZE = max(1, int(os.environ.get("SGLJAX_DSA_LIVE_GROUP", "4")))
 
 
 def _page_buckets(pages_per_seq: int, pages_per_block: int) -> tuple[int, ...]:
@@ -92,7 +99,7 @@ def streamindex_topk_live(
     if batch == 0:
         return jnp.full((0, k), -1, jnp.int32)
 
-    group_size = min(4, batch)
+    group_size = min(_GROUP_SIZE, batch)
     # Leave one group's lookahead after the real rows: a bucket run can end
     # at any row, so the final partial group still needs a full static slice.
     padded_batch = ((batch + group_size - 1) // group_size) * group_size + group_size - 1

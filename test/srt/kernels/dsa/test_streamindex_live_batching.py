@@ -56,4 +56,4 @@ def test_bucket_groups_restore_rows_and_packed_page_offsets(monkeypatch):
 
     expected = np.repeat((np.arange(batch, dtype=np.int32) * 100 + 1)[:, None], topk, axis=1)
     np.testing.assert_array_equal(np.asarray(result), expected)
-    assert seen_batch_sizes and set(seen_batch_sizes) == {4}
+    assert seen_batch_sizes and set(seen_batch_sizes) == {min(streamindex_live._GROUP_SIZE, batch)}
