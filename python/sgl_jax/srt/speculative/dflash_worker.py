@@ -1283,9 +1283,14 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
             model = nnx.merge(model_def, state)
             kv_list = model.materialize_kv(target_hidden, positions)
-            for i, (k, v) in enumerate(kv_list):
-                pool.set_kv_buffer(pool.start_layer + i, cache_loc, k, v)
-            return pool.kv_buffer
+            # Draft layer ids are 0..L-1, offset by start_layer on a plain MHA pool. A hybrid
+            # SWA pool (GLM-5.3 DFlash2 draft: all layers sliding-window) has no start_layer;
+            # it routes global layer ids through layers_mapping and remaps full -> SWA slots.
+            start = getattr(pool, "start_layer", 0) or 0
+            layer_ids = [start + i for i in range(len(kv_list))]
+            for layer_id, (k, v) in zip(layer_ids, kv_list):
+                pool.set_kv_buffer(layer_id, cache_loc, k, v)
+            return [pool.get_fused_kv_buffer(layer_id) for layer_id in layer_ids]
 
         self._jit_materialize_write = _partial(draft_extend, model_def, model_state_def)
 
@@ -1346,8 +1351,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             active_mask,
             pool,
         )
-        for i, buf in enumerate(new_buffers):
-            pool.kv_buffer[i] = buf
+        pool.replace_buffer(list(new_buffers))
 
     @staticmethod
     def _prefill_draft_extend_metadata(model_worker_batch, target_hidden):
