@@ -2169,7 +2169,13 @@ class ServerArgs:
                 or str(arg).startswith("--speculative-num-draft-tokens=")
                 for arg in explicit_cli_args
             )
-            if (
+            # The explicit-CLI record does not reach every process of a multi-host launch, so an
+            # explicit value equal to the default (4) could be re-inferred (8) on some hosts and
+            # not others. SGLJAX_DFLASH_NUM_DRAFT_TOKENS pins the width on every process.
+            env_draft_tokens = os.environ.get("SGLJAX_DFLASH_NUM_DRAFT_TOKENS")
+            if env_draft_tokens:
+                self.speculative_num_draft_tokens = int(env_draft_tokens)
+            elif (
                 not explicit_draft_tokens
                 and self.speculative_num_draft_tokens == ServerArgs.speculative_num_draft_tokens
             ):
