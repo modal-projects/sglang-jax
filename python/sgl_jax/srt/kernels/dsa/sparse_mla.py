@@ -86,6 +86,23 @@ def compute_topk_pages(
     return jnp.pad(hit_pages, ((0, 0), (0, k_pages_max - k_eff)), constant_values=-1)
 
 
+
+def _seq_page_lookup(page_indices, seq_page_start, local, pages_per_seq):
+    """``page_indices[seq_page_start[:, None] + local]`` for local in [0, pages_per_seq).
+
+    The direct form is an element gather of T * k_pages_max scattered int32s (v6e-16 EP16 decode
+    at c128: ~290 us per full layer). Gather each token's contiguous pages_per_seq-row instead
+    (k_pages_max / pages_per_seq x fewer elements) and select within it by a fused one-hot
+    compare-sum (exact: one non-zero term). Falls back to the direct gather when the one-hot
+    would be large."""
+    t, k = local.shape
+    if t * k * pages_per_seq > _BITMAP_MAX_ELEMS:
+        return page_indices[seq_page_start[:, None] + local]
+    cols = jnp.arange(pages_per_seq, dtype=seq_page_start.dtype)
+    rows = page_indices.at[seq_page_start[:, None] + cols[None, :]].get(mode="clip")  # [T, pps]
+    onehot = local[:, :, None] == cols[None, None, :].astype(local.dtype)  # [T, k, pps]
+    return jnp.sum(jnp.where(onehot, rows[:, None, :], 0), axis=-1).astype(page_indices.dtype)
+
 @functools.partial(
     jax.jit,
     static_argnames=(
@@ -272,7 +289,7 @@ def sparse_mla_page_level(
     else:
         sp_phys = jnp.where(
             (col < n_used[:, None]) & tok_valid[:, None],
-            page_indices[seq_page_start[:, None] + sp_local],
+            _seq_page_lookup(page_indices, seq_page_start, sp_local, pages_per_seq),
             cache_kv.shape[0] - 1,
         )
 

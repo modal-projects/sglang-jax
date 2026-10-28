@@ -21,3 +21,15 @@ def test_compute_topk_pages_fast_path_matches_reference(monkeypatch, t, sel, pps
     assert fast.shape == ref.shape == (t, kmax)
     sparse_mla.compute_topk_pages.clear_cache()
     np.testing.assert_array_equal(np.asarray(fast), np.asarray(ref))
+
+
+@pytest.mark.parametrize("t,k,pps", [(1, 511, 128), (128, 511, 128), (9, 64, 16)])
+def test_seq_page_lookup_matches_gather(t, k, pps):
+    rng = np.random.default_rng(t + k)
+    n_pages = t * pps + 7
+    page_indices = jnp.asarray(rng.permutation(n_pages), jnp.int32)
+    starts = jnp.asarray(np.sort(rng.integers(0, n_pages - pps, size=t)), jnp.int32)
+    local = jnp.asarray(rng.integers(0, pps, size=(t, k)), jnp.int32)
+    got = sparse_mla._seq_page_lookup(page_indices, starts, local, pps)
+    want = page_indices[starts[:, None] + local]
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
