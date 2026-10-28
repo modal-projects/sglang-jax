@@ -64,6 +64,13 @@ class KDAVerifyRecord:
     g: jax.Array  # [B, T, H, K] activated log-space gate
     beta: jax.Array  # [B, T, H]
     mesh: jax.sharding.Mesh = dataclasses.field(metadata=dict(static=True), default=None)
+    # SGLJAX_KDA_VERIFY_CHUNK=1 records: k/v are post-conv (pre-l2norm) and g is the RAW gate
+    # (pre-activation), all flat [B*T, ...]; the commit runs the chunked prefill kernel.
+    chunk: bool = dataclasses.field(metadata=dict(static=True), default=False)
+    A_log: jax.Array | None = None  # [H]
+    dt_bias: jax.Array | None = None  # [H, K]
+    scale: float | None = dataclasses.field(metadata=dict(static=True), default=None)
+    lower_bound: float | None = dataclasses.field(metadata=dict(static=True), default=None)
 
 
 jax.tree_util.register_dataclass(KDAVerifyRecord)
@@ -83,10 +90,45 @@ def commit_kda_verify(record: KDAVerifyRecord, num_tokens: jax.Array):
     ``(ssm_full, [conv_full])`` pool buffers for the layer.
     """
     mesh = record.mesh
-    T = record.k.shape[1]
+    B = record.h0.shape[0]
+    T = record.k.shape[0] // B if record.chunk else record.k.shape[1]
     W = record.conv0_q.shape[-1]
     # Committed tokens per request are in [0, T]; a larger count would read past the conv window.
     steps = jnp.clip(num_tokens.astype(jnp.int32), 0, T)
+    if record.chunk:
+        new_state = _commit_state_chunked(record, steps, T)
+    else:
+        new_state = _commit_state_naive(record, steps, T)
+    return _commit_scatter(record, steps, T, W, new_state)
+
+
+_NEG_GATE = -1.0e4  # raw gate for a masked step: activated gate -> 0 (no decay), exactly
+
+
+def _commit_state_chunked(record, steps, T):
+    """State after ``steps`` tokens via the chunked prefill kernel: non-live steps get k = v = 0,
+    beta = 0 and a raw gate of -1e4 (activated gate 0) -- exact no-ops of the recurrence."""
+    B = record.h0.shape[0]
+    live = (jnp.arange(T, dtype=jnp.int32)[None, :] < steps[:, None]).reshape(-1)  # [B*T]
+    k = jnp.where(live[:, None, None], record.k, jnp.zeros_like(record.k))
+    v = jnp.where(live[:, None, None], record.v, jnp.zeros_like(record.v))
+    g = jnp.where(live[:, None, None], record.g, jnp.full_like(record.g, _NEG_GATE))
+    beta = jnp.where(live[:, None], record.beta, jnp.zeros_like(record.beta))
+    cu = jnp.arange(B + 1, dtype=jnp.int32) * T
+    dp = record.mesh.shape["data"]
+    if dp > 1:  # per-DP-shard cumsum layout: [dp, B/dp + 1]
+        per = B // dp
+        cu = jnp.tile(jnp.arange(per + 1, dtype=jnp.int32) * T, dp)
+    cu = jax.sharding.reshard(cu, jax.sharding.NamedSharding(record.mesh, P("data")))
+    _, state = kda_extend_chunked(
+        record.mesh, jnp.zeros_like(k), k, v, g, beta, record.h0, cu,
+        record.A_log, record.dt_bias, record.scale, record.lower_bound,
+    )
+    return state
+
+
+def _commit_state_naive(record, steps, T):
+    mesh = record.mesh
 
     def _replay(k, v, g, beta, h0, steps):
         live = jnp.arange(T, dtype=jnp.int32)[None, :] < steps[:, None]  # [B, T]
@@ -107,7 +149,7 @@ def commit_kda_verify(record: KDAVerifyRecord, num_tokens: jax.Array):
         )
         return state.astype(h0.dtype)
 
-    new_state = jax.shard_map(
+    return jax.shard_map(
         _replay,
         mesh=mesh,
         in_specs=(
@@ -121,6 +163,10 @@ def commit_kda_verify(record: KDAVerifyRecord, num_tokens: jax.Array):
         out_specs=P("data", "tensor", None, None),
         check_vma=False,
     )(record.k, record.v, record.g, record.beta, record.h0, steps)
+
+
+def _commit_scatter(record, steps, T, W, new_state):
+    mesh = record.mesh
 
     def _conv_window(c0, x, steps):
         b, d, _ = c0.shape
@@ -195,6 +241,9 @@ def commit_recurrent_verify(pool_updates: dict, num_tokens: jax.Array) -> dict:
 # while a dense rewrite of the pool is a few us. Exact: every output element has at most one
 # non-zero term (slots are unique per request; idx 0 = padding, never written).
 _CONV_DENSE = os.environ.get("SGLJAX_KDA_CONV_DENSE", "0") == "1"
+# Opt-in: DFlash TARGET_VERIFY / commit through the chunked prefill kernel instead of the
+# token-by-token naive recurrence (v8a 226 profile, c32 k8: naive verify + replay = ~35 of 88 ms).
+_VERIFY_CHUNK = os.environ.get("SGLJAX_KDA_VERIFY_CHUNK", "0") == "1"
 
 
 def _prec(dtype):
@@ -248,6 +297,133 @@ def kda_decode_kernel_choice() -> str:
             f"SGLANG_JAX_KDA_DECODE_KERNEL must be 'pallas', 'naive' or 'auto', got {choice!r}"
         )
     return choice
+
+
+def kda_extend_chunked(mesh, q, k, v, g, beta, initial_state, cu_seqlens, A_log, dt_bias, scale,
+                       lower_bound):
+    """Packed varlen KDA prefill (Mega KDA with chunked fallback) under shard_map.
+
+    q/k/v post-conv (l2norm in kernel), g the RAW gate (activation in kernel), beta post-sigmoid.
+    Returns (o [T, H, V], final_state [N, H, K, V] in initial_state's dtype)."""
+    kernel = os.environ.get("SGLANG_JAX_KDA_PREFILL_KERNEL", "mega").strip().lower()
+    if kernel not in {"chunked", "mega", "resident", "fused_resident"}:
+        raise ValueError(
+            "SGLANG_JAX_KDA_PREFILL_KERNEL must be 'chunked', 'mega', or 'resident', "
+            f"got {kernel!r}"
+        )
+    use_mega = kernel == "mega"
+    use_resident = kernel in {"resident", "fused_resident"}
+
+    def _prefill_call(q, k, v, g, beta, initial_state, cu_seqlens, A_log, dt_bias):
+        operands = (q, k, v, g, beta, initial_state, cu_seqlens, A_log, dt_bias)
+
+        if use_resident:
+            o, final_state, *_ = resident_pipeline_kda_fwd(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                scale,
+                initial_state,
+                True,
+                cu_seqlens,
+                safe_gate=True,
+                lower_bound=lower_bound,
+                use_gate_in_kernel=True,
+                use_qk_l2norm_in_kernel=True,
+                A_log=A_log,
+                dt_bias=dt_bias,
+            )
+            return o, final_state
+
+        def _chunked(args):
+            q, k, v, g, beta, initial_state, cu_seqlens, A_log, dt_bias = args
+            q = l2_normalize(q)
+            k = l2_normalize(k)
+            o, final_state, *_ = chunk_kda(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                scale=scale,
+                initial_state=initial_state,
+                output_final_state=True,
+                cu_seqlens=cu_seqlens,
+                use_gate_in_kernel=True,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                lower_bound=lower_bound,
+                pipeline_impl="incumbent",
+            )
+            return o, final_state
+
+        if not use_mega:
+            return _chunked(operands)
+
+        def _mega(args):
+            q, k, v, g, beta, initial_state, cu_seqlens, A_log, dt_bias = args
+            return kda_forward_packed(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                cu_seqlens=cu_seqlens,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                scale=scale,
+                initial_state=initial_state,
+                lower_bound=lower_bound,
+                pipeline_impl="incumbent",
+            )
+
+        padded_tokens = (q.shape[1] + 63) // 64 * 64
+        layout_supported = is_mega_kda_layout_supported(
+            cu_seqlens,
+            padded_tokens,
+        )
+        return jax.lax.cond(layout_supported, _mega, _chunked, operands)
+
+    sharded = jax.shard_map(
+        _prefill_call,
+        mesh=mesh,
+        in_specs=(
+            P(None, "data", "tensor", None),  # q [1, T, H, K]
+            P(None, "data", "tensor", None),  # k [1, T, H, K]
+            P(None, "data", "tensor", None),  # v [1, T, H, V]
+            P(None, "data", "tensor", None),  # g [1, T, H, K]
+            P(None, "data", "tensor"),  # beta [1, T, H]
+            P("data", "tensor", None, None),  # initial_state [N, H, K, V]
+            P("data"),  # cu_seqlens [N+1]
+            P("tensor"),  # A_log [H]
+            P("tensor", None),  # dt_bias [H, K]
+        ),
+        out_specs=(
+            P(None, "data", "tensor", None),  # output [1, T, H, V]
+            P("data", "tensor", None, None),  # final_state [N, H, K, V]
+        ),
+        check_vma=False,
+    )
+    # Kernel expects [1, T_packed, H, K] packed layout; strip after.
+    # The prefill kernels take and return an FP32 state; a bf16 recurrent pool
+    # (SGLANG_JAX_RECURRENT_STATE_DTYPE=bfloat16) is widened here and the final state is
+    # rounded back to the pool dtype (the decode kernel does the same load/store in-kernel).
+    state_dtype = initial_state.dtype
+    o, final_state = sharded(
+        q[None, ...],
+        k[None, ...],
+        v[None, ...],
+        g[None, ...],
+        beta[None, ...],
+        initial_state.astype(jnp.float32),
+        cu_seqlens,
+        A_log,
+        dt_bias,
+    )
+    return o[0], final_state.astype(state_dtype)
+
 
 
 class KDAAttnBackend(LinearRecurrentAttnBackend):
@@ -347,6 +523,46 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
                 layer,
                 scale=layer.scale,
             )
+        elif is_verify and _VERIFY_CHUNK:
+            # Chunked-kernel verify: outputs from the prefill kernel over each request's T rows
+            # (block-aligned cu_q_lens), no pool writes; commit reruns it on the accepted prefix.
+            if layer.A_log is None or layer.dt_bias is None:
+                raise ValueError("KDA gate activation requires layer.A_log and layer.dt_bias")
+            H = q.shape[-2]
+            A_log = layer.A_log.value.reshape(H)
+            dt_bias = layer.dt_bias.value.reshape(H, -1)
+            lower_bound = getattr(layer, "kda_gate_lower_bound", None)
+            if lower_bound is None:
+                lower_bound = getattr(layer, "kda_lower_bound", None)
+            output, _ = kda_extend_chunked(
+                self.mesh, q, k, v, a, b, ssm_states, cu_q_lens, A_log, dt_bias, layer.scale,
+                lower_bound,
+            )
+            _, conv_full_list = self.get_layer_cache(recurrent_state_pool, layer.layer_id)
+            ssm_full, _ = self.get_layer_cache(recurrent_state_pool, layer.layer_id)
+            record = KDAVerifyRecord(
+                ssm_full=ssm_full,
+                conv_full=conv_full_list[0],
+                recurrent_indices=recurrent_indices,
+                h0=ssm_states,
+                conv0_q=q_state,
+                conv0_k=k_state,
+                conv0_v=v_state,
+                x_q=x_q,
+                x_k=x_k,
+                x_v=x_v,
+                k=k,
+                v=v,
+                g=a,
+                beta=b,
+                mesh=self.mesh,
+                chunk=True,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                scale=None if layer.scale is None else float(layer.scale),
+                lower_bound=None if lower_bound is None else float(lower_bound),
+            )
+            return output.reshape(output.shape[0], -1), (record, list(conv_full_list))
         elif is_verify:
             # Multi-token window per request (T = draft tokens), no pool writes: the commit
             # after acceptance replays the accepted prefix (commit_kda_verify).
@@ -642,124 +858,9 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         lower_bound = getattr(layer, "kda_gate_lower_bound", None)
         if lower_bound is None:
             lower_bound = getattr(layer, "kda_lower_bound", None)
-        kernel = os.environ.get("SGLANG_JAX_KDA_PREFILL_KERNEL", "mega").strip().lower()
-        if kernel not in {"chunked", "mega", "resident", "fused_resident"}:
-            raise ValueError(
-                "SGLANG_JAX_KDA_PREFILL_KERNEL must be 'chunked', 'mega', or 'resident', "
-                f"got {kernel!r}"
-            )
-        use_mega = kernel == "mega"
-        use_resident = kernel in {"resident", "fused_resident"}
-
-        def _prefill_call(q, k, v, g, beta, initial_state, cu_seqlens, A_log, dt_bias):
-            operands = (q, k, v, g, beta, initial_state, cu_seqlens, A_log, dt_bias)
-
-            if use_resident:
-                o, final_state, *_ = resident_pipeline_kda_fwd(
-                    q,
-                    k,
-                    v,
-                    g,
-                    beta,
-                    scale,
-                    initial_state,
-                    True,
-                    cu_seqlens,
-                    safe_gate=True,
-                    lower_bound=lower_bound,
-                    use_gate_in_kernel=True,
-                    use_qk_l2norm_in_kernel=True,
-                    A_log=A_log,
-                    dt_bias=dt_bias,
-                )
-                return o, final_state
-
-            def _chunked(args):
-                q, k, v, g, beta, initial_state, cu_seqlens, A_log, dt_bias = args
-                q = l2_normalize(q)
-                k = l2_normalize(k)
-                o, final_state, *_ = chunk_kda(
-                    q,
-                    k,
-                    v,
-                    g,
-                    beta,
-                    scale=scale,
-                    initial_state=initial_state,
-                    output_final_state=True,
-                    cu_seqlens=cu_seqlens,
-                    use_gate_in_kernel=True,
-                    A_log=A_log,
-                    dt_bias=dt_bias,
-                    lower_bound=lower_bound,
-                    pipeline_impl="incumbent",
-                )
-                return o, final_state
-
-            if not use_mega:
-                return _chunked(operands)
-
-            def _mega(args):
-                q, k, v, g, beta, initial_state, cu_seqlens, A_log, dt_bias = args
-                return kda_forward_packed(
-                    q,
-                    k,
-                    v,
-                    g,
-                    beta,
-                    cu_seqlens=cu_seqlens,
-                    A_log=A_log,
-                    dt_bias=dt_bias,
-                    scale=scale,
-                    initial_state=initial_state,
-                    lower_bound=lower_bound,
-                    pipeline_impl="incumbent",
-                )
-
-            padded_tokens = (q.shape[1] + 63) // 64 * 64
-            layout_supported = is_mega_kda_layout_supported(
-                cu_seqlens,
-                padded_tokens,
-            )
-            return jax.lax.cond(layout_supported, _mega, _chunked, operands)
-
-        sharded = jax.shard_map(
-            _prefill_call,
-            mesh=self.mesh,
-            in_specs=(
-                P(None, "data", "tensor", None),  # q [1, T, H, K]
-                P(None, "data", "tensor", None),  # k [1, T, H, K]
-                P(None, "data", "tensor", None),  # v [1, T, H, V]
-                P(None, "data", "tensor", None),  # g [1, T, H, K]
-                P(None, "data", "tensor"),  # beta [1, T, H]
-                P("data", "tensor", None, None),  # initial_state [N, H, K, V]
-                P("data"),  # cu_seqlens [N+1]
-                P("tensor"),  # A_log [H]
-                P("tensor", None),  # dt_bias [H, K]
-            ),
-            out_specs=(
-                P(None, "data", "tensor", None),  # output [1, T, H, V]
-                P("data", "tensor", None, None),  # final_state [N, H, K, V]
-            ),
-            check_vma=False,
+        return kda_extend_chunked(
+            self.mesh, q, k, v, g, beta, initial_state, cu_seqlens, A_log, dt_bias, scale, lower_bound
         )
-        # Kernel expects [1, T_packed, H, K] packed layout; strip after.
-        # The prefill kernels take and return an FP32 state; a bf16 recurrent pool
-        # (SGLANG_JAX_RECURRENT_STATE_DTYPE=bfloat16) is widened here and the final state is
-        # rounded back to the pool dtype (the decode kernel does the same load/store in-kernel).
-        state_dtype = initial_state.dtype
-        o, final_state = sharded(
-            q[None, ...],
-            k[None, ...],
-            v[None, ...],
-            g[None, ...],
-            beta[None, ...],
-            initial_state.astype(jnp.float32),
-            cu_seqlens,
-            A_log,
-            dt_bias,
-        )
-        return o[0], final_state.astype(state_dtype)
 
     @named_scope("kda_decode")
     def _forward_decode(
