@@ -538,6 +538,9 @@ def _eplb_logical_to_physical(topk_ids, l2all, nv):
     expert, from host-constant tables (spreads hot experts over their redundant slots)."""
     l2all = jnp.asarray(np.asarray(l2all, np.int32))  # [E, R]
     nv = jnp.asarray(np.asarray(nv, np.int32))  # [E]
+    mesh = jax.sharding.get_abstract_mesh()
+    if mesh is not None and not mesh.empty:
+        nv = jax.sharding.reshard(nv, P())
     t, k = topk_ids.shape
     ids = topk_ids.astype(jnp.int32)
     rr = (
@@ -545,7 +548,12 @@ def _eplb_logical_to_physical(topk_ids, l2all, nv):
         + jax.lax.broadcasted_iota(jnp.int32, (t, k), 1)
     ) % nv[ids]
     flat = ids * l2all.shape[1] + rr
-    return l2all.reshape(-1)[flat].astype(topk_ids.dtype)
+    table = l2all.reshape(-1)
+    # Explicit-mesh gather: the table must live on the ids' mesh (replicated).
+    mesh = jax.sharding.get_abstract_mesh()
+    if mesh is not None and not mesh.empty:
+        table = jax.sharding.reshard(table, P())
+    return table[flat].astype(topk_ids.dtype)
 
 
 class Glm5NextForConditionalGeneration(nnx.Module):
