@@ -1326,7 +1326,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         sc = layer.logit_cap if layer is not None else None
 
         def _run(ql_, qpe_, kvc_, kpe_, cache_, seq_lens_, pi_, cuq_, cukv_, dist_):
-            return mla_ragged_paged_attention(
+            o_, cache_out = mla_ragged_paged_attention(
                 ql_,
                 qpe_,
                 kvc_,
@@ -1345,6 +1345,13 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                 decode_batch_size=self.decode_batch_size,
                 vmem_limit_bytes=self.vmem_limit_bytes,
             )
+            # Rows past this shard's last cu_q_len (bucket padding; DFlash verify's inactive slots
+            # carry T rows each with extend 0) are never written by the kernel, so they hold
+            # whatever the output buffer had -- possibly NaN. One NaN row poisons every token
+            # through dense one-hot / einsum combines downstream (EPMoE, KDA conv-dense). Zero them.
+            covered = jnp.arange(o_.shape[0], dtype=jnp.int32) < cuq_[-1]
+            o_ = jnp.where(covered.reshape((-1,) + (1,) * (o_.ndim - 1)), o_, jnp.zeros_like(o_))
+            return o_, cache_out
 
         return jax.shard_map(_run, in_specs=in_specs, out_specs=out_specs, check_vma=False)(
             ql,
