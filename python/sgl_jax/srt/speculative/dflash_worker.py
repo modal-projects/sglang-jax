@@ -754,6 +754,30 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             else np.zeros_like(bad_l)
         )
         self._nan_debug_step = getattr(self, "_nan_debug_step", 0) + 1
+        # Pools after this step's commit: which state went non-finite first (first ~200 steps).
+        if self._nan_debug_step <= 200 and not getattr(self, "_nan_pool_reported", False):
+            pools = self.target_worker.model_runner.memory_pools
+            report = {}
+            rsp = getattr(pools, "recurrent_state_pool", None)
+            if rsp is not None:
+                ssm_bad = [
+                    i for i, b in enumerate(rsp.recurrent_buffers)
+                    if bool(jax.device_get(jnp.any(~jnp.isfinite(b))))
+                ]
+                conv_bad = [
+                    i for i, cl in enumerate(rsp.conv_buffers)
+                    if any(bool(jax.device_get(jnp.any(~jnp.isfinite(c)))) for c in cl)
+                ]
+                report["kda_ssm_bad_layers"] = ssm_bad[:8]
+                report["kda_conv_bad_layers"] = conv_bad[:8]
+            kv = getattr(pools, "token_to_kv_pool", None)
+            kvb = getattr(kv, "kv_buffer", None) or []
+            report["kv_bad_layers"] = [
+                i for i, b in enumerate(kvb) if bool(jax.device_get(jnp.any(~jnp.isfinite(b))))
+            ][:8]
+            if any(report.values()):
+                logger.warning("[DFLASH NAN] step=%d pools: %s", self._nan_debug_step, report)
+                self._nan_pool_reported = True
         if not (bad_l.any() or bad_h.any()):
             return
         T = self.block_size
