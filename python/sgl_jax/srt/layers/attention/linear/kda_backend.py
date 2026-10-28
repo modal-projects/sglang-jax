@@ -732,18 +732,22 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
             check_vma=False,
         )
         # Kernel expects [1, T_packed, H, K] packed layout; strip after.
+        # The prefill kernels take and return an FP32 state; a bf16 recurrent pool
+        # (SGLANG_JAX_RECURRENT_STATE_DTYPE=bfloat16) is widened here and the final state is
+        # rounded back to the pool dtype (the decode kernel does the same load/store in-kernel).
+        state_dtype = initial_state.dtype
         o, final_state = sharded(
             q[None, ...],
             k[None, ...],
             v[None, ...],
             g[None, ...],
             beta[None, ...],
-            initial_state,
+            initial_state.astype(jnp.float32),
             cu_seqlens,
             A_log,
             dt_bias,
         )
-        return o[0], final_state
+        return o[0], final_state.astype(state_dtype)
 
     @named_scope("kda_decode")
     def _forward_decode(

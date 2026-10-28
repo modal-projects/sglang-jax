@@ -341,7 +341,7 @@ def create_test_data(
         recurrent_partition_axis="tensor",
         conv_partition_axis="tensor",
         data_partition_axis="data",
-        temporal_dtype=jnp.float32,
+        temporal_dtype=_TEST_STATE_DTYPE,
         conv_dtype=dtype,
     )
     # q/k/v/a/b unsharded for ref; reshard in run_test for the backend call.
@@ -437,6 +437,10 @@ def create_test_data(
         mask[:, None, None], initial_conv_state_dev, jnp.zeros_like(initial_conv_state_dev)
     )
     return fb, pool, layer, q, k, v, a, b, initial_ssm_ref, initial_conv_ref, recurrent_indices
+
+
+# Recurrent pool dtype for create_test_data (bf16 variant: TestKDAAttentionBf16State).
+_TEST_STATE_DTYPE = jnp.float32
 
 
 class TestKDAAttention(unittest.TestCase):
@@ -809,6 +813,21 @@ class TestKDAAttention(unittest.TestCase):
             trk_conv = np.asarray(gather_conv(pool, conv_buffer_list[0], track))
         np.testing.assert_array_equal(trk_ssm, run_ssm)
         np.testing.assert_array_equal(trk_conv, run_conv)
+
+
+class TestKDAAttentionBf16State(TestKDAAttention):
+    """Same cases with a bf16 recurrent pool (SGLANG_JAX_RECURRENT_STATE_DTYPE=bfloat16): kernels
+    compute in FP32 and the pool stores bf16 (prefill state widened/rounded in kda_backend)."""
+
+    def setUp(self):
+        super().setUp()
+        global _TEST_STATE_DTYPE
+        self._prev_dtype = _TEST_STATE_DTYPE
+        _TEST_STATE_DTYPE = jnp.bfloat16
+
+    def tearDown(self):
+        global _TEST_STATE_DTYPE
+        _TEST_STATE_DTYPE = self._prev_dtype
 
 
 if __name__ == "__main__":
