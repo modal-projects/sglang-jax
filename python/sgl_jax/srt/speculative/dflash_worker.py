@@ -38,6 +38,7 @@ from sgl_jax.srt.speculative.relay_buffer import (
     update_dflash_relay_buffers,
 )
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
+from sgl_jax.srt.utils.jax_utils import device_array
 from sgl_jax.srt.speculative.overlap_utils import to_host
 
 logger = logging.getLogger(__name__)
@@ -486,9 +487,9 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             0,
         )
         data_sharding = NamedSharding(self.mesh, P("data"))
-        relay_indices = jax.device_put(safe_indices, data_sharding)
-        relay_valid_mask = jax.device_put(valid_mask, data_sharding)
-        relay_new_seq_lens = jax.device_put(
+        relay_indices = device_array(safe_indices, data_sharding)
+        relay_valid_mask = device_array(valid_mask, data_sharding)
+        relay_new_seq_lens = device_array(
             np.asarray(seq_lens, dtype=np.int32) + 1,
             data_sharding,
         )
@@ -668,10 +669,10 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             seq_lens=np.asarray(model_worker_batch.seq_lens, dtype=np.int32),
             target_prefix_lens=np.asarray(target_prefix_lens, dtype=np.int32),
             positions_host=positions_flat,
-            allocated_lens=jax.device_put(allocated_lens, data_sharding),
-            reservation_base_lens=jax.device_put(reservation_base_lens, data_sharding),
-            relay_future_indices=jax.device_put(relay_future_indices, data_sharding),
-            relay_valid_mask=jax.device_put(active_mask, data_sharding),
+            allocated_lens=device_array(allocated_lens, data_sharding),
+            reservation_base_lens=device_array(reservation_base_lens, data_sharding),
+            relay_future_indices=device_array(relay_future_indices, data_sharding),
+            relay_valid_mask=device_array(active_mask, data_sharding),
             use_relay_state=use_relay_state,
             dp_size=int(model_worker_batch.dp_size),
             bs=bs,
@@ -850,7 +851,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             dist = np.column_stack(
                 [np.zeros_like(local_n), np.zeros_like(local_n), local_n]
             ).reshape(-1)
-            md.distribution = jax.device_put(dist, NamedSharding(self.mesh, P("data")))
+            md.distribution = device_array(dist, NamedSharding(self.mesh, P("data")))
             return md
         if isinstance(backend, FlashAttention) or type(backend) is type(
             self.draft_model_runner.attn_backend
@@ -1132,6 +1133,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         model_state_def = runner._model_state_def
         draft_token_num = self.block_size
         token_sharding = NamedSharding(runner.mesh, P("data"))
+        replicated = NamedSharding(runner.mesh, P())
 
         @_partial(
             jax.jit,
@@ -1210,12 +1212,16 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                     new_seq_lens,
                     dp_size=dp_size,
                 )
+            # The host reads accept_lens / next_token_ids every step on every process. Return them
+            # fully replicated so each host copies its local replica; a P("data") array spanning
+            # other hosts needs a separate process_allgather program + host round trip per fetch
+            # (v16 107c: ~1-3 ms each, serialized between steps).
             return (
                 output,
                 pool_updates,
                 layers_topk_ids,
-                accept_lens_out,
-                next_token_ids_flat,
+                jax.sharding.reshard(accept_lens_out, replicated),
+                jax.sharding.reshard(next_token_ids_flat, replicated),
                 new_verified_id,
                 new_seq_lens,
                 updated_relay_buffers,
@@ -1687,9 +1693,9 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         data_sharding = NamedSharding(self.mesh, P("data"))
         cached = DFlashVerifyBucketTemplate(
             extend_seq_lens=extend_seq_lens,
-            cu_q_lens=jax.device_put(cu_q_lens.reshape(-1), data_sharding),
-            active_mask=jax.device_put(active_host, data_sharding),
-            distribution=jax.device_put(distribution, data_sharding),
+            cu_q_lens=device_array(cu_q_lens.reshape(-1), data_sharding),
+            active_mask=device_array(active_host, data_sharding),
+            distribution=device_array(distribution, data_sharding),
         )
         self._verify_bucket_templates[key] = cached
         return cached
@@ -1871,7 +1877,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             seq_lens=prefix_lens + 1,
             target_prefix_lens=prefix_lens,
             positions_host=np.asarray(draft_batch.positions, dtype=np.int32),
-            allocated_lens=jax.device_put(allocated_lens, data_sharding),
+            allocated_lens=device_array(allocated_lens, data_sharding),
             reservation_base_lens=jax.device_put(prefix_lens, data_sharding),
             relay_future_indices=relay_future_indices,
             relay_valid_mask=active_mask,

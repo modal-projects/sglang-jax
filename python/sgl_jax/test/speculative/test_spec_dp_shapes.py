@@ -605,3 +605,22 @@ def test_dflash_decode_mwb_carries_recurrent_slots(dp, bs_per_rank):
         seg = np.asarray(mwb.recurrent_indices[r * per_dp : (r + 1) * per_dp])
         np.testing.assert_array_equal(seg[:n], np.arange(1, n + 1) + 10 * r)
         assert np.all(seg[n:] == 0)
+
+
+def test_to_host_reads_local_replica_without_allgather(monkeypatch):
+    """Fully replicated multi-host arrays are read from the local replica (no process_allgather)."""
+    import jax.experimental.multihost_utils as mu
+
+    from sgl_jax.srt.speculative.overlap_utils import to_host
+
+    calls = []
+    monkeypatch.setattr(mu, "process_allgather", lambda *a, **k: calls.append(1))
+    data = np.arange(6, dtype=np.int32)
+    fake = SimpleNamespace(
+        is_fully_addressable=False,
+        sharding=SimpleNamespace(is_fully_replicated=True),
+        addressable_shards=[SimpleNamespace(data=data)],
+    )
+    np.testing.assert_array_equal(to_host(fake), data)
+    assert not calls
+    np.testing.assert_array_equal(to_host(data), data)

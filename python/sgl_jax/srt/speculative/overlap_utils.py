@@ -7,6 +7,11 @@ def to_host(x):
     Every process reaches this for the same array, so the allgather is collective-safe.
     """
     if getattr(x, "is_fully_addressable", True) is False:
+        sharding = getattr(x, "sharding", None)
+        if sharding is not None and getattr(sharding, "is_fully_replicated", False):
+            # Every device holds the whole array: read the local replica (no collective program,
+            # no cross-host round trip).
+            return np.asarray(x.addressable_shards[0].data)
         from jax.experimental.multihost_utils import process_allgather
 
         x = process_allgather(x, tiled=True)
