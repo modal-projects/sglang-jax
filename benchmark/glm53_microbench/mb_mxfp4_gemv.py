@@ -280,8 +280,10 @@ def main():
             for path in paths:
                 if is_fp4(fmt):
                     # "scalew": decode tiles with the weight-scaled full-K matmul (SGLJAX_FP4_DECODE_SCALEW)
-                    os.environ["SGLJAX_FP4_PATH"] = "decode" if path in ("scalew", "bits") else path
+                    os.environ["SGLJAX_FP4_PATH"] = "decode" if path in ("scalew", "bits", "dec16") else path
                     os.environ["SGLJAX_FP4_DECODE_SCALEW"] = {"scalew": "1", "bits": "2"}.get(path, "0")
+                    # "dec16": the K32 decode path with 16-row tiles (SGLJAX_FP4_DECODE_TILE_M)
+                    os.environ["SGLJAX_FP4_DECODE_TILE_M"] = "16" if path == "dec16" else "32"
                     jax.clear_caches()  # the path is chosen at trace time
                 for m in ms:
                     rows = m * TOPK
@@ -317,7 +319,7 @@ def main():
                             except Exception as e:  # noqa: BLE001
                                 case["path_error"] = str(e)[:300]
                             finally:
-                                os.environ["SGLJAX_FP4_PATH"] = "decode" if path in ("scalew", "bits") else path
+                                os.environ["SGLJAX_FP4_PATH"] = "decode" if path in ("scalew", "bits", "dec16") else path
                         if mode == "aot":
                             state = (SD((rows, H), jnp.bfloat16), SD((e_total,), jnp.int32),
                                      SD((1,), jnp.int32))
@@ -353,6 +355,7 @@ def main():
                         results.append(case)
             os.environ.pop("SGLJAX_FP4_PATH", None)
             os.environ.pop("SGLJAX_FP4_DECODE_SCALEW", None)
+            os.environ.pop("SGLJAX_FP4_DECODE_TILE_M", None)
             del consts, w1, s1, w2, s2
             if not fused:
                 del wg, sg, wu, su
