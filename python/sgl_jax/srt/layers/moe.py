@@ -1085,6 +1085,11 @@ class EPMoE(nnx.Module):
         n = int(disp["token_indices"].shape[0])
         cap = max(64, math.ceil(_EPMOE_COMPACT_CF * n * self.experts_per_device / self.num_experts))
         cap = -(-cap // 32) * 32
+        tokens = int(disp["inputs_2d"].shape[0])
+        # The one-hot combine is [tokens, cap] f32: keep it to decode / verify sizes (prefill
+        # chunks take the full path).
+        if tokens * cap > (1 << 22):
+            return 0
         return cap if cap < n else 0
 
     def _experts_local_compact(
