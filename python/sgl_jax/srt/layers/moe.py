@@ -1,5 +1,6 @@
 """GMM-based Expert-Parallel MoE layer and weight mapping utilities."""
 
+import contextlib
 import logging
 import math
 import os
@@ -126,6 +127,25 @@ _MOE_FUSED_GLU_DOWN_MAX_ROWS = 2048
 # Row tile for the fused GLU+down kernel, applied when M > tile_m (decode shapes: one grid step per
 # expert at 32 rows; kernel default would be min(M, 128)).
 _MOE_FUSED_TILE_M = 32
+
+
+# Opt-in (SGLJAX_EPMOE_DP_RS=1): under DP attention every chip runs its experts on the tokens of all
+# DP groups, and the combine was a full psum over the expert axis followed by each DP group slicing
+# its own tokens. With the flag the combine is a reduce-scatter over the expert axis (token chunk e
+# lands on flat device e, whose data index is e // tensor_size, i.e. exactly its DP group's
+# contiguous token range), so the reshard to P('data') only all-gathers within a DP group.
+_EPMOE_DP_RS = os.environ.get("SGLJAX_EPMOE_DP_RS", "0") == "1"
+_scatter_expert_depth = 0
+
+
+class _scatter_on_expert:
+    def __enter__(self):
+        global _scatter_expert_depth
+        _scatter_expert_depth += 1
+
+    def __exit__(self, *exc):
+        global _scatter_expert_depth
+        _scatter_expert_depth -= 1
 
 
 class EPMoE(nnx.Module):
@@ -791,9 +811,22 @@ class EPMoE(nnx.Module):
             ]
         )
         scatter_on_tensor = "tensor" in out_specs
+        tok_axis = out_sharding.spec[0] if len(out_sharding.spec) else None
+        dp_rs = (
+            _EPMOE_DP_RS
+            and self.ep_size > 1
+            and self.tp_size == 1
+            and self.mesh.shape.get("data", 1) > 1
+            and tok_axis == "data"
+            and hidden_states.shape[0] % self.ep_size == 0
+            and not (reduce_deferred() and fused_moe_enabled())
+        )
+        if dp_rs:
+            out_specs = P("expert", *([None] * (hidden_states.ndim - 1)))
+        rs_ctx = _scatter_on_expert() if dp_rs else contextlib.nullcontext()
 
         # Run MoE computation on the expert-parallel mesh
-        with jax.sharding.use_abstract_mesh(self.updated_mesh):
+        with jax.sharding.use_abstract_mesh(self.updated_mesh), rs_ctx:
             hidden_states_reshard = jax.sharding.reshard(hidden_states, P(None))
             topk_weights_reshard = jax.sharding.reshard(topk_weights, P(None))
             topk_ids_reshard = jax.sharding.reshard(topk_ids, P(None))
@@ -1513,6 +1546,14 @@ class EPMoE(nnx.Module):
     def _combine(self, data):
         if reduce_deferred() and fused_moe_enabled():
             return data  # partial; the model reduces routed+shared with one fused_all_reduce
+        if _scatter_expert_depth > 0:
+            # Reduce-scatter as all_to_all + local sum: XLA:TPU lowers a small psum_scatter to a
+            # full all-reduce + slice, so it saves nothing; the a2a moves (n-1)/n of the
+            # operand once and the sum is local (f32 accumulate).
+            n = jax.lax.axis_size("expert")
+            chunks = data.reshape((n, data.shape[0] // n) + data.shape[1:])
+            recv = jax.lax.all_to_all(chunks, "expert", split_axis=0, concat_axis=0, tiled=True)
+            return jnp.sum(recv.reshape(chunks.shape).astype(jnp.float32), axis=0).astype(data.dtype)
         return jax.lax.psum(data, "expert")
 
     def _permute(self, inputs, top_k_indices):

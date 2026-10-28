@@ -394,7 +394,13 @@ class Glm5NextDecoderLayer(nnx.Module):
                         routed = self.mlp(h, topk_weights, topk_ids)
                     mlp_out = fused_all_reduce(routed + shared, self.mesh)
                 else:
-                    mlp_out = self.mlp(h, topk_weights, topk_ids)
+                    # Under DP attention the routed output lands token-sharded on 'data' (the
+                    # tokens' own layout) instead of replicated; with SGLJAX_EPMOE_DP_RS=1 EPMoE
+                    # then combines by reduce-scatter (see layers/moe.py).
+                    out_sh = None
+                    if self.mesh.shape.get("data", 1) > 1:
+                        out_sh = NamedSharding(self.mesh, P("data", *([None] * (h.ndim - 1))))
+                    mlp_out = self.mlp(h, topk_weights, topk_ids, out_sharding=out_sh)
                     if self.shared_experts is not None:
                         mlp_out = mlp_out + self.shared_experts(h)
             else:
