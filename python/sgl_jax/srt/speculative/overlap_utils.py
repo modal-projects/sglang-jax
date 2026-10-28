@@ -1,6 +1,18 @@
 import numpy as np
 
 
+def to_host(x):
+    """np.asarray that also works for a global array spanning other hosts (multi-host DP).
+
+    Every process reaches this for the same array, so the allgather is collective-safe.
+    """
+    if getattr(x, "is_fully_addressable", True) is False:
+        from jax.experimental.multihost_utils import process_allgather
+
+        x = process_allgather(x, tiled=True)
+    return np.asarray(x)
+
+
 def resolve_spec_prefill_token_ids(result):
     """Resolve prefill next-token ids prepared by the producer path."""
     token_ids_arr = result.next_token_ids
@@ -11,7 +23,7 @@ def resolve_spec_prefill_token_ids(result):
         )
     if hasattr(token_ids_arr, "copy_to_host_async"):
         token_ids_arr.copy_to_host_async()
-    return np.asarray(token_ids_arr).tolist()
+    return to_host(token_ids_arr).tolist()
 
 
 def publish_spec_decode_new_seq_lens(batch_output):
@@ -90,8 +102,8 @@ def resolve_spec_decode_token_ids(result, batch, draft_token_num: int):
         result.next_token_ids.copy_to_host_async()
     if hasattr(result.accept_lens, "copy_to_host_async"):
         result.accept_lens.copy_to_host_async()
-    next_token_ids = np.asarray(result.next_token_ids)
-    accept_lens = np.asarray(result.accept_lens).tolist()
+    next_token_ids = to_host(result.next_token_ids)
+    accept_lens = to_host(result.accept_lens).tolist()
     per_dp_bs = batch.per_dp_bs_size
     total_bs = per_dp_bs * batch.dp_size
     predict_tokens: list[list[int]] = [[] for _ in range(total_bs)]
