@@ -207,7 +207,23 @@ def _kda_decode_kernel(
     #               (hi + mid + lo == x, every partial sum exact in f32).
     #   "mxu_head": same, one matmul per head.
     #   "xlu":      transpose + lane-broadcast (XLU-bound; ~1.7x more bundles).
-    for r in range(R):
+    if column_mode == "xpose":
+        # State transposed in VMEM ([V, K]: K on lanes), so every per-K operand is ONE row vreg
+        # broadcast over sublanes (no replicated column build), and the two K-contractions are
+        # lane reductions. Same fp32 operation order per element as naive_recurrent_kda.
+        for r in range(R):
+            x = x_ref[r]  # [Hb, 4K + V]
+            for h in range(hb_size):
+                row = x[h : h + 1]
+                eg, kk, bk, qs = (row[:, t * K : (t + 1) * K] for t in range(_N_COLS))  # [1, K]
+                vcol = row[:, _N_COLS * K :].T  # [V, 1]
+                sT = in_buf[slot, r * hb_size + h].astype(jnp.float32).T  # [V, K]
+                s1 = sT * eg
+                u = jnp.sum(s1 * kk, axis=1, keepdims=True)  # [V, 1]
+                s2 = s1 + (vcol - u) * bk
+                out_buf[slot, r * hb_size + h] = s2.T.astype(out_buf.dtype)
+                o_ref[r, pl.ds(h, 1), :] = jnp.sum(s2 * qs, axis=1, keepdims=True).T
+    for r in range(R if column_mode != "xpose" else 0):
         x = x_ref[r]  # [Hb, 4K + V]
         if column_mode in ("mxu", "mxu_head"):
             p = sel_ref.shape[0] // 3
@@ -324,7 +340,8 @@ def kda_decode_pool(
     assert k.shape == (B, H, K) and g.shape == (B, H, K), (q.shape, k.shape, g.shape)
     assert v.shape == (B, H, V) and beta.shape == (B, H), (v.shape, beta.shape)
     assert pool.ndim == 4 and pool.shape[1:] == (H, K, V), (pool.shape, (H, K, V))
-    assert column_mode in ("mxu", "mxu_head", "xlu"), column_mode
+    column_mode = os.environ.get("SGLJAX_KDA_DECODE_COLUMNS", column_mode)
+    assert column_mode in ("mxu", "mxu_head", "xlu", "xpose"), column_mode
     assert K % 128 == 0 and V % 128 == 0, f"head dims must be lane-aligned, got K={K} V={V}"
     if scale is None:
         scale = K**-0.5
