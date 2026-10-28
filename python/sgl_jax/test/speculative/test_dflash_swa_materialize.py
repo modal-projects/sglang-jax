@@ -30,10 +30,13 @@ class _FakeDraft(nnx.Module):
     def materialize_kv(self, target_hidden, positions):
         base = target_hidden[:, : HEADS * HD].reshape(-1, HEADS, HD)
         base = base + positions[:, None, None].astype(base.dtype)
-        return [
-            ((base * self.scale[i]).astype(jnp.bfloat16), (-base * self.scale[i]).astype(jnp.bfloat16))
-            for i in range(LAYERS)
-        ]
+        spec = jax.sharding.PartitionSpec("data", "tensor", None)
+        out = []
+        for i in range(LAYERS):
+            k = (base * self.scale[i]).astype(jnp.bfloat16)
+            v = (-base * self.scale[i]).astype(jnp.bfloat16)
+            out.append((jax.sharding.reshard(k, spec), jax.sharding.reshard(v, spec)))
+        return out
 
 
 def _pool(mesh):
