@@ -735,9 +735,15 @@ class Glm5NextForConditionalGeneration(nnx.Module):
             mlp = self.model.layers[i].mlp
             if not getattr(mlp, "fp4_packed", False):
                 raise ValueError(f"layer {i}: EPMoE was not built with weight_format=mxfp4")
-            ptl = getattr(mlp, "physical_to_logical_map", None)
+            # EPLB: physical slot p holds logical expert ptl[p]. Read the global metadata (the
+            # module attribute is wrapped by nnx and no longer a plain array).
+            from sgl_jax.srt.eplb.expert_location import get_global_expert_location_metadata
+
+            eplb = get_global_expert_location_metadata()
             expert_ids = (
-                np.asarray(ptl) if ptl is not None else np.arange(cfg.n_routed_experts)
+                np.asarray(jax.device_get(eplb.physical_to_logical_map))[i].astype(np.int64)
+                if eplb is not None
+                else np.arange(cfg.n_routed_experts)
             )
             tgt = f"model.layers.{i}.mlp"
             for name in ("wi_0", "wi_1", "wo"):
