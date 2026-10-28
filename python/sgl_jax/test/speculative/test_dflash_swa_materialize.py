@@ -75,10 +75,11 @@ def test_materialize_into_swa_pool_dp4(mesh):
     cache_loc = np.full(DP * rows_per_rank, -1, np.int32)
     for r, n in enumerate(live_per_rank):
         if n:
-            loc = alloc.alloc(n, dp_rank=r)
-            ref_loc = ref_alloc.alloc(n, dp_rank=r)
+            need = -(-n // PAGE) * PAGE
+            loc = alloc.alloc(need, dp_rank=r)
+            ref_loc = ref_alloc.alloc(need, dp_rank=r)
             np.testing.assert_array_equal(loc, ref_loc)
-            cache_loc[r * rows_per_rank : r * rows_per_rank + n] = loc
+            cache_loc[r * rows_per_rank : r * rows_per_rank + n] = loc[:n]
     hidden = jax.random.normal(jax.random.key(0), (DP * rows_per_rank, HEADS * HD + 7), jnp.float32)
     positions = np.arange(DP * rows_per_rank, dtype=np.int32)
 
