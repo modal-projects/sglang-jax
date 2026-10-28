@@ -59,6 +59,26 @@ from sgl_jax.srt.utils.quantization.quark import FP8_BLOCK128, fp8_linear_module
 
 logger = logging.getLogger(__name__)
 
+# SGL_JAX_LAYER_NAN_DEBUG=1: after every layer, flag rows whose hidden state is non-finite and log
+# the first offending layer / rows / positions per forward (host callback; debug only).
+_LAYER_NAN_DEBUG = os.getenv("SGL_JAX_LAYER_NAN_DEBUG", "0") == "1"
+_layer_nan_reports = [0]
+
+
+def _report_layer_nans(bad, positions, mode):
+    bad = np.asarray(bad)
+    if not bad.any() or _layer_nan_reports[0] >= 20:
+        return
+    _layer_nan_reports[0] += 1
+    first_layer = int(np.argmax(bad.any(axis=1)))
+    rows = np.flatnonzero(bad[first_layer])
+    pos = np.asarray(positions)
+    logger.warning(
+        "[LAYER NAN] mode=%d first_bad_layer=%d rows=%s positions=%s n_rows=%d bad_rows_last_layer=%d",
+        int(mode), first_layer, rows[:32].tolist(), pos[rows[:32]].tolist() if len(pos) else [],
+        bad.shape[1], int(bad[-1].sum()),
+    )
+
 
 class _AllExcept:
     """``x in _AllExcept(s)`` is ``x not in s`` (the mapping builder's "unquantized" test)."""
@@ -459,6 +479,7 @@ class Glm5NextModel(nnx.Module):
         layers_recurrent, layers_conv = [], []
         dsa_topk, dsa_topk_pages = None, None
         aux_hidden_states = []
+        nan_rows = []
 
         for layer_id, layer in enumerate(self.layers):
             if layer_id in self.layers_to_capture:
@@ -488,6 +509,16 @@ class Glm5NextModel(nnx.Module):
                 if attn_state.topk_pages is not None:
                     dsa_topk_pages = attn_state.topk_pages
             layers_topk_ids.append(topk_ids)
+            if _LAYER_NAN_DEBUG:
+                nan_rows.append(jnp.any(~jnp.isfinite(hidden_states), axis=-1))
+
+        if _LAYER_NAN_DEBUG:
+            jax.debug.callback(
+                _report_layer_nans,
+                jnp.stack(nan_rows),
+                forward_batch.positions,
+                jnp.int32(int(forward_batch.forward_mode)),
+            )
 
         if len(self.layers) in self.layers_to_capture:
             aux_hidden_states.append(hc_contract(hidden_states, hc))
