@@ -199,23 +199,28 @@ def _prec(dtype):
 
 
 def _dense_rows_get(buf, idx):
+    # No flatten: a reshape of the [S, C, K-1] pool forces a relayout copy (XLA keeps C minor).
     slots = buf.shape[0]
     onehot = (idx[:, None] == jnp.arange(slots, dtype=idx.dtype)[None, :]).astype(buf.dtype)
-    flat = buf.reshape(slots, -1)
-    out = jnp.matmul(onehot, flat, preferred_element_type=jnp.float32, precision=_prec(buf.dtype))
-    return out.astype(buf.dtype).reshape((idx.shape[0],) + buf.shape[1:])
+    out = jnp.einsum(
+        "bs,s...->b...", onehot, buf, preferred_element_type=jnp.float32, precision=_prec(buf.dtype)
+    )
+    return out.astype(buf.dtype)
 
 
 def _dense_rows_set(buf, idx, val, write):
     slots = buf.shape[0]
     hit = (idx[None, :] == jnp.arange(slots, dtype=idx.dtype)[:, None]) & write[None, :]  # [S, B]
-    flat = val.reshape(val.shape[0], -1).astype(buf.dtype)
-    scattered = jnp.matmul(
-        hit.astype(buf.dtype), flat, preferred_element_type=jnp.float32, precision=_prec(buf.dtype)
+    scattered = jnp.einsum(
+        "sb,b...->s...",
+        hit.astype(buf.dtype),
+        val.astype(buf.dtype),
+        preferred_element_type=jnp.float32,
+        precision=_prec(buf.dtype),
     )
-    written = jnp.any(hit, axis=1)
-    out = jnp.where(written[:, None], scattered.astype(buf.dtype), buf.reshape(slots, -1))
-    return out.reshape(buf.shape)
+    written = jnp.any(hit, axis=1).reshape((slots,) + (1,) * (buf.ndim - 1))
+    return jnp.where(written, scattered.astype(buf.dtype), buf)
+
 
 def kda_decode_kernel_choice() -> str:
     """``SGLANG_JAX_KDA_DECODE_KERNEL``: ``pallas`` | ``naive`` | ``auto`` (default).
