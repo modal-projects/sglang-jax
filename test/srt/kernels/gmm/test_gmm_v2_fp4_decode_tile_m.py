@@ -62,11 +62,11 @@ def test_decode_tile_m(sizes):
     o32 = _run({**base, "SGLJAX_FP4_DECODE_TILE_M": "32"}, *args)
     o16 = _run({**base, "SGLJAX_FP4_DECODE_TILE_M": "16"}, *args)
     o8 = _run({**base, "SGLJAX_FP4_DECODE_TILE_M": "8"}, *args)
-    np.testing.assert_array_equal(o8[lo:hi], o32[lo:hi])
     oau = _run({**base, "SGLJAX_FP4_DECODE_TILE_M": "auto"}, *args)
     lo, hi = 0, m
     np.testing.assert_array_equal(o16[lo:hi], o32[lo:hi])
     np.testing.assert_array_equal(oau[lo:hi], o32[lo:hi])
+    np.testing.assert_array_equal(o8[lo:hi], o32[lo:hi])
     ref = np.zeros((m, N), np.float32)
     r = lo
     for g in range(G):
