@@ -108,8 +108,9 @@ def fp4_packed_use_full_k(dims) -> bool:
     hint = getattr(_FP4_ROWS_HINT, "v", None)
     if path == "auto" and hint is not None and os.environ.get("SGLJAX_FP4_DECODE_TILE_M") == "auto":
         # v8b EP8 microbench (decode tm32 vs full-K, us/layer): 28 rows/expert 1174 vs 1255,
-        # 57 rows/expert 2004 vs 1616 -> full-K from ~40 rows/expert (spec verify at high c).
-        return hint >= float(os.environ.get("SGLJAX_FP4_FULLK_MIN_ROWS_HINT", "40"))
+        # 57 rows/expert 2004 vs 1616; v16 034f9-133 (pack v2): 28 rows 710 vs 728, 43 rows 1020 vs 944
+        # -> full-K from ~30 rows/expert (spec verify at high c).
+        return hint >= float(os.environ.get("SGLJAX_FP4_FULLK_MIN_ROWS_HINT", "30"))
     if path not in ("auto", "decode", "fullk"):
         raise ValueError(f"SGLJAX_FP4_PATH must be auto, decode or fullk, got {path!r}")
     if path != "auto":
