@@ -170,20 +170,21 @@ def _collapse_kernel(
     norm_eps: float,
     dot_precision,
 ):
-    x = x_ref[...]  # [BT, hc, d]
+    # x_ref is the flat [BT, hc*d] view: stream s is the lane-aligned slice s*d:(s+1)*d (a
+    # [BT, hc, d] block puts hc on sublanes and every per-stream slice became a sublane
+    # select/rotate relayout: v6e LLO 8493 -> fewer bundles at 96 tokens).
+    x = x_ref[...]  # [BT, hc*d]
     bt = x.shape[0]
     y_ref, *extra_outs = outs
     # Fuse RMS with projection to reuse the resident activation. Its reduction
     # tree differs from XLA's, so a few ULP of output drift are expected.
     rms = jax.lax.rsqrt(
-        jnp.sum(jnp.square(x.astype(jnp.float32).reshape(bt, hc * d)), axis=-1, keepdims=True)
-        / (hc * d)
-        + norm_eps
+        jnp.sum(jnp.square(x.astype(jnp.float32)), axis=-1, keepdims=True) / (hc * d) + norm_eps
     )
 
     if mode == "head":
         # Head requires the FP32 normalize -> BF16 round -> projection boundary.
-        xf = x.astype(jnp.float32).reshape(bt, hc * d)
+        xf = x.astype(jnp.float32)
         normalized = (xf * rms).astype(jnp.bfloat16)
         if dot_precision == jax.lax.Precision.HIGHEST:
             # Preserve the BF16 boundary, then widen for the FP32 MXU contract.
@@ -196,7 +197,7 @@ def _collapse_kernel(
             preferred_element_type=jnp.float32,
         )
     else:
-        xf = x.astype(jnp.float32).reshape(bt, hc * d)
+        xf = x.astype(jnp.float32)
         # Pre moves the RMS scalar after the linear projection.
         mixes = (
             jax.lax.dot_general(
@@ -223,7 +224,9 @@ def _collapse_kernel(
     # Stream each residual into one accumulator instead of widening [BT, hc, d].
     collapsed = jnp.zeros((bt, d), dtype=jnp.float32)
     for stream in range(hc):
-        collapsed = collapsed + pre[:, stream, None] * x[:, stream, :].astype(jnp.float32)
+        collapsed = collapsed + pre[:, stream, None] * x[:, stream * d : (stream + 1) * d].astype(
+            jnp.float32
+        )
     y_ref[...] = collapsed.astype(y_ref.dtype)
 
 
@@ -307,13 +310,13 @@ def _run(
         dot_precision=dot_precision,
     )
     in_specs = [
-        pl.BlockSpec((bt, hc, d), lambda i: (i, 0, 0)),
+        pl.BlockSpec((bt, hc * d), lambda i: (i, 0)),
         pl.BlockSpec((rows, hc * d), lambda i: (0, 0)),
         pl.BlockSpec((4, 1), lambda i: (0, 0)),
         pl.BlockSpec((rows, 1), lambda i: (0, 0)),
     ]
     operands = [
-        x_streams,
+        x_streams.reshape(n_pad, hc * d),  # contiguous: free
         hc_fn.astype(jnp.float32),
         scale_p,
         hc_base.astype(jnp.float32).reshape(rows, 1),

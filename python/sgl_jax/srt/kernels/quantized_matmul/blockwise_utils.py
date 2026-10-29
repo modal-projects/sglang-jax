@@ -26,6 +26,7 @@ After obtaining a seed, the final tile sizes are clamped and snapped to
 the actual local matrix dimensions so that the kernel launch is always valid.
 """
 
+import os
 import importlib
 import logging
 import math
@@ -359,6 +360,14 @@ def get_safe_blockwise_tuned_value(
         except Exception:
             logger.debug("Failed to query tuned block sizes for blockwise kernel.", exc_info=True)
             tuned = None
+    if os.environ.get("SGLJAX_QMM_DECODE_TILES", "0") == "1" and int(n_batch) <= 256:
+        # Decode-size batches: the tuned tables pick small batch/in blocks (e.g. 32/256), so a
+        # 48-64-row call streams the weight once per 32-row tile and pays per-K-step overhead
+        # (v6e AOT, [48 x 4096] x [3072 x 4096] fp8: 64.9k cycles at (32,1024,256) vs 15.2k at
+        # (64,512,4096); HBM floor ~13.4k). One batch tile, full-K (<= 4096), 512-wide N.
+        tuned = tuned_value_cls(
+            int(n_batch), 512, min(int(n_in), 4096), 1
+        )
     if tuned is None:
         # --- Tier 3: conservative default seed ---
         # Final sizes are still clamped to the current local shape below,

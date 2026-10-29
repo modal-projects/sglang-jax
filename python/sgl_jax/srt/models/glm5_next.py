@@ -332,7 +332,31 @@ class Glm5NextDecoderLayer(nnx.Module):
         self.moe_gate, self.topk = moe_router(config, mesh, layer_id)
         self.moe_backend = getattr(config, "moe_backend", MoEBackend.FUSED_V2)
         if self.moe_backend == MoEBackend.EPMOE:
+            # EPLB (--ep-num-redundant-experts / --init-expert-location): EPMoE sizes itself to the
+            # physical slots from the global metadata; the loader fills slot p with logical expert
+            # physical_to_logical_map[layer_id][p] (load_weights reads mlp.physical_to_logical_map).
+            from sgl_jax.srt.eplb.expert_location import get_global_expert_location_metadata
+
+            eplb = get_global_expert_location_metadata()
+            ptl = (
+                np.asarray(jax.device_get(eplb.physical_to_logical_map))[layer_id]
+                if eplb is not None
+                else None
+            )
+            # Logical -> physical replicas of this layer as host constants (tuples: nnx leaves
+            # plain Python data alone). Routing spreads each logical expert's rows over its
+            # replicas round-robin by (token, k) -- the shared "static" map always picks
+            # replica 0, so redundant slots would sit idle.
+            if eplb is not None:
+                l2all = np.asarray(jax.device_get(eplb.logical_to_all_physical_map))[layer_id]
+                nv = np.maximum((l2all >= 0).sum(-1), 1)
+                self._eplb_l2all = tuple(map(tuple, np.where(l2all >= 0, l2all, 0).tolist()))
+                self._eplb_nv = tuple(int(x) for x in nv)
+            else:
+                self._eplb_l2all = None
+                self._eplb_nv = None
             self.mlp = EPMoE(
+                physical_to_logical_map=ptl,
                 hidden_size=config.hidden_size,
                 num_experts=config.n_routed_experts,
                 num_experts_per_tok=config.num_experts_per_tok,
@@ -397,9 +421,14 @@ class Glm5NextDecoderLayer(nnx.Module):
         # ---- MLP sublayer ----
         if self.is_moe_layer:
             router_logits = self.moe_gate(h)
+            eplb_l2all = getattr(self, "_eplb_l2all", None)
             topk_weights, topk_ids = self.topk(
-                router_logits, self.moe_gate.bias.value, dispatch_info=dispatch_info
+                router_logits,
+                self.moe_gate.bias.value,
+                dispatch_info=None if eplb_l2all is not None else dispatch_info,
             )
+            if eplb_l2all is not None:
+                topk_ids = _eplb_logical_to_physical(topk_ids, eplb_l2all, self._eplb_nv)
             if self.moe_backend == MoEBackend.EPMOE:
                 # Opt-in (SGLANG_JAX_ONESHOT_AR_MIN_BYTES>0, SITES has "fused"): shared down_proj
                 # and the EPMoE combine return per-device partials, reduced with one all-reduce
@@ -535,8 +564,48 @@ class Glm5NextModel(nnx.Module):
         )
 
 
+def _eplb_logical_to_physical(topk_ids, l2all, nv):
+    """[T, k] logical ids -> physical slots: replica (t * k + j) % num_replicas of each logical
+    expert, from host-constant tables (spreads hot experts over their redundant slots)."""
+    l2all = jnp.asarray(np.asarray(l2all, np.int32))  # [E, R]
+    nv = jnp.asarray(np.asarray(nv, np.int32))  # [E]
+    mesh = jax.sharding.get_abstract_mesh()
+    if mesh is not None and not mesh.empty:
+        nv = jax.sharding.reshard(nv, P())
+    t, k = topk_ids.shape
+    ids = topk_ids.astype(jnp.int32)
+    out_sh = getattr(jax.typeof(ids), "sharding", None)
+    spec = out_sh.spec if (out_sh is not None and mesh is not None and not mesh.empty) else None
+
+    def take(tab, idx):
+        return tab.at[idx].get(out_sharding=spec) if spec is not None else tab[idx]
+
+    rr = (
+        jax.lax.broadcasted_iota(jnp.int32, (t, k), 0) * k
+        + jax.lax.broadcasted_iota(jnp.int32, (t, k), 1)
+    ) % take(nv, ids)
+    flat = ids * l2all.shape[1] + rr
+    table = l2all.reshape(-1)
+    # Explicit-mesh gather: the table must live on the ids' mesh (replicated).
+    mesh = jax.sharding.get_abstract_mesh()
+    if mesh is not None and not mesh.empty:
+        table = jax.sharding.reshard(table, P())
+    return take(table, flat).astype(topk_ids.dtype)
+
+
 class Glm5NextForConditionalGeneration(nnx.Module):
     """Serving class for `zai-org/GLM-5.3-Flash` (HF arch `Glm5NextForConditionalGeneration`)."""
+
+    @classmethod
+    def get_expert_location_config(cls, hf_config) -> dict:
+        """EPLB fields (GLM-5.3 names its routed-expert count n_routed_experts); the per-layer
+        maps are indexed by absolute layer id (the first_k_dense_replace dense layers get zero
+        counts and keep a trivial map)."""
+        return {
+            "num_experts": int(getattr(hf_config, "n_routed_experts", 0)),
+            "num_layers": int(getattr(hf_config, "num_hidden_layers", 0)),
+            "num_groups": int(getattr(hf_config, "n_group", 1) or 1),
+        }
 
     @classmethod
     def patch_model_config(cls, config: ModelConfig) -> None:
@@ -743,9 +812,15 @@ class Glm5NextForConditionalGeneration(nnx.Module):
             mlp = self.model.layers[i].mlp
             if not getattr(mlp, "fp4_packed", False):
                 raise ValueError(f"layer {i}: EPMoE was not built with weight_format=mxfp4")
-            ptl = getattr(mlp, "physical_to_logical_map", None)
+            # EPLB: physical slot p holds logical expert ptl[p]. Read the global metadata (the
+            # module attribute is wrapped by nnx and no longer a plain array).
+            from sgl_jax.srt.eplb.expert_location import get_global_expert_location_metadata
+
+            eplb = get_global_expert_location_metadata()
             expert_ids = (
-                np.asarray(ptl) if ptl is not None else np.arange(cfg.n_routed_experts)
+                np.asarray(jax.device_get(eplb.physical_to_logical_map))[i].astype(np.int64)
+                if eplb is not None
+                else np.arange(cfg.n_routed_experts)
             )
             tgt = f"model.layers.{i}.mlp"
             for name in ("wi_0", "wi_1", "wo"):
